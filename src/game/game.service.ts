@@ -30,6 +30,7 @@ export class GameService {
       currentTurn: 'one',
       winner: null,
       winningLine: null,
+      isDraw: false,
       createdAt: new Date(),
     };
 
@@ -69,6 +70,7 @@ export class GameService {
         currentTurn: 'one',
         winner: null,
         winningLine: null,
+        isDraw: false,
         error: 'Room not found',
       };
     }
@@ -81,6 +83,7 @@ export class GameService {
         currentTurn: room.currentTurn,
         winner: room.winner,
         winningLine: room.winningLine,
+        isDraw: room.isDraw,
         error: 'Player not in room',
       };
     }
@@ -92,17 +95,19 @@ export class GameService {
         currentTurn: room.currentTurn,
         winner: room.winner,
         winningLine: room.winningLine,
+        isDraw: room.isDraw,
         error: 'Not your turn',
       };
     }
 
-    if (room.winner) {
+    if (room.winner || room.isDraw) {
       return {
         success: false,
         board: room.board,
         currentTurn: room.currentTurn,
         winner: room.winner,
         winningLine: room.winningLine,
+        isDraw: room.isDraw,
         error: 'Game already finished',
       };
     }
@@ -123,6 +128,7 @@ export class GameService {
         currentTurn: room.currentTurn,
         winner: room.winner,
         winningLine: room.winningLine,
+        isDraw: room.isDraw,
         error: 'Column is full',
       };
     }
@@ -135,6 +141,8 @@ export class GameService {
     if (winResult) {
       room.winner = winResult.winner;
       room.winningLine = winResult.line;
+    } else if (this.checkDraw(room.board)) {
+      room.isDraw = true;
     } else {
       // Switch turns
       room.currentTurn = room.currentTurn === 'one' ? 'two' : 'one';
@@ -148,6 +156,7 @@ export class GameService {
       currentTurn: room.currentTurn,
       winner: room.winner,
       winningLine: room.winningLine,
+      isDraw: room.isDraw,
     };
   }
 
@@ -159,6 +168,7 @@ export class GameService {
     room.currentTurn = 'one';
     room.winner = null;
     room.winningLine = null;
+    room.isDraw = false;
 
     this.rooms.set(roomId, room);
     return true;
@@ -173,6 +183,7 @@ export class GameService {
       currentTurn: room.currentTurn,
       winner: room.winner,
       winningLine: room.winningLine,
+      isDraw: room.isDraw,
       players: {
         playerOne: room.players[0] ? { id: room.players[0].id, connected: true } : null,
         playerTwo: room.players[1] ? { id: room.players[1].id, connected: true } : null,
@@ -239,6 +250,11 @@ export class GameService {
       }
     }
     return null;
+  }
+
+  private checkDraw(board: GameBoard): boolean {
+    // Check if all cells are filled
+    return board.every((row) => row.every((cell) => cell !== null));
   }
 
   private generateRoomId(): string {

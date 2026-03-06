@@ -16,6 +16,7 @@ export interface GameRoom {
   currentTurn: PlayerRole;
   winner: PlayerRole | null;
   winningLine: [number, number][] | null;
+  isDraw: boolean;
   createdAt: Date;
 }
 
@@ -37,6 +38,7 @@ export interface GameState {
   currentTurn: PlayerRole;
   winner: PlayerRole | null;
   winningLine: [number, number][] | null;
+  isDraw: boolean;
   players: {
     playerOne: { id: string; connected: boolean } | null;
     playerTwo: { id: string; connected: boolean } | null;
@@ -55,5 +57,6 @@ export interface MoveResult {
   currentTurn: PlayerRole;
   winner: PlayerRole | null;
   winningLine: [number, number][] | null;
+  isDraw: boolean;
   error?: string;
 }
