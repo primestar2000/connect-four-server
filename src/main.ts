@@ -9,8 +9,9 @@ async function bootstrap(): Promise<void> {
     credentials: true,
   });
 
-  await app.listen(3002);
-  console.log('🚀 Connect Four WebSocket server running on http://localhost:3002');
+  const port = process.env.PORT || 3002;
+  await app.listen(port);
+  console.log(`🚀 Connect Four WebSocket server running on http://localhost:${port}`);
 }
 
 bootstrap();
