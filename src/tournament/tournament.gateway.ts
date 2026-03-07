@@ -206,4 +206,69 @@ export class TournamentGateway {
       });
     }
   }
+
+  @SubscribeMessage('leaveTournament')
+  async handleLeaveTournament(
+    @MessageBody() data: { tournamentId: string; playerId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const result = await this.tournamentService.leaveTournament(data.tournamentId, data.playerId);
+
+      // Leave socket room
+      client.leave(`tournament:${data.tournamentId}`);
+
+      if (result.deleted) {
+        // Tournament was deleted (no players left)
+        this.server.emit('tournamentDeleted', {
+          tournamentId: data.tournamentId,
+        });
+
+        return {
+          success: true,
+          deleted: true,
+          message: 'Tournament deleted (no players remaining)',
+        };
+      }
+
+      // Notify remaining players
+      this.server.to(`tournament:${data.tournamentId}`).emit('tournamentUpdated', {
+        tournament: result.tournament,
+      });
+
+      return {
+        success: true,
+        deleted: false,
+        tournament: result.tournament,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to leave tournament',
+      };
+    }
+  }
+
+  @SubscribeMessage('deleteTournament')
+  async handleDeleteTournament(@MessageBody() data: { tournamentId: string; requesterId: string }) {
+    try {
+      const result = await this.tournamentService.deleteTournament(
+        data.tournamentId,
+        data.requesterId,
+      );
+
+      // Notify all players in tournament
+      this.server.to(`tournament:${data.tournamentId}`).emit('tournamentDeleted', {
+        tournamentId: data.tournamentId,
+        message: 'Tournament has been deleted by the creator',
+      });
+
+      return result;
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to delete tournament',
+      };
+    }
+  }
 }

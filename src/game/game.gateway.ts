@@ -107,29 +107,43 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       }
 
       if (result.remainingPlayers === 0) {
-        console.log(`Room ${result.roomId} deleted - no players remaining`);
+        console.log(`Room ${result.roomId} empty - scheduling deletion in 10 minutes`);
 
-        // Check if this was a tournament game with both players disconnected
+        // Schedule room deletion after 10 minutes grace period
+        // This allows Player 2 to join even if Player 1 disconnected temporarily
         setTimeout(async () => {
-          try {
-            const dbGame = await this.tournamentService['prisma'].game.findUnique({
-              where: { id: result.roomId },
-              include: { tournament: true },
-            });
+          const room = this.gameService.getRoom(result.roomId);
 
-            if (dbGame?.tournamentId && dbGame.status !== 'COMPLETED') {
-              console.log(`Both players disconnected from tournament game ${result.roomId}`);
-              // Mark as draw or handle according to rules
-              await this.tournamentService.completeGame(result.roomId, null, true);
+          // Only delete if room still exists and is still empty
+          if (room && room.players.every((p) => p.socketId === '')) {
+            console.log(`Deleting empty room ${result.roomId} after grace period`);
 
-              this.server.emit('tournamentUpdated', {
-                tournamentId: dbGame.tournamentId,
+            // Check if this was a tournament game with both players disconnected
+            try {
+              const dbGame = await this.tournamentService['prisma'].game.findUnique({
+                where: { id: result.roomId },
+                include: { tournament: true },
               });
+
+              if (dbGame?.tournamentId && dbGame.status !== 'COMPLETED') {
+                console.log(`Both players disconnected from tournament game ${result.roomId}`);
+                // Mark as draw or handle according to rules
+                await this.tournamentService.completeGame(result.roomId, null, true);
+
+                this.server.emit('tournamentUpdated', {
+                  tournamentId: dbGame.tournamentId,
+                });
+              }
+            } catch (error) {
+              console.error('Error handling both players disconnect:', error);
             }
-          } catch (error) {
-            console.error('Error handling both players disconnect:', error);
+
+            // Finally delete the room
+            this.gameService.removeRoom(result.roomId);
+          } else {
+            console.log(`Room ${result.roomId} has players - keeping alive`);
           }
-        }, 30000); // Wait 30 seconds to see if anyone reconnects
+        }, 600000); // 10 minutes = 600,000 milliseconds
       }
     }
   }

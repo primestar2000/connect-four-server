@@ -522,4 +522,109 @@ export class TournamentService {
     }
     return shuffled;
   }
+
+  // Cleanup methods for empty tournaments
+  async leaveTournament(tournamentId: string, playerId: string) {
+    const tournament = await this.prisma.tournament.findUnique({
+      where: { id: tournamentId },
+      include: {
+        players: true,
+      },
+    });
+
+    if (!tournament) {
+      throw new Error('Tournament not found');
+    }
+
+    if (tournament.status !== TournamentStatus.PENDING) {
+      throw new Error('Cannot leave tournament that has already started');
+    }
+
+    // Remove player from tournament
+    await this.prisma.tournamentPlayer.deleteMany({
+      where: {
+        tournamentId,
+        playerId,
+      },
+    });
+
+    // Check if tournament is now empty
+    const remainingPlayers = await this.prisma.tournamentPlayer.count({
+      where: { tournamentId },
+    });
+
+    // If no players left, delete the tournament
+    if (remainingPlayers === 0) {
+      console.log(`Deleting empty tournament ${tournamentId}`);
+      await this.prisma.tournament.delete({
+        where: { id: tournamentId },
+      });
+      return { deleted: true, tournament: null };
+    }
+
+    // Return updated tournament
+    const updatedTournament = await this.getTournament(tournamentId);
+    return { deleted: false, tournament: updatedTournament };
+  }
+
+  async deleteTournament(tournamentId: string, requesterId: string) {
+    const tournament = await this.prisma.tournament.findUnique({
+      where: { id: tournamentId },
+    });
+
+    if (!tournament) {
+      throw new Error('Tournament not found');
+    }
+
+    // Only creator can delete tournament
+    if (tournament.creatorId !== requesterId) {
+      throw new Error('Only tournament creator can delete the tournament');
+    }
+
+    // Can only delete pending tournaments
+    if (tournament.status !== TournamentStatus.PENDING) {
+      throw new Error('Cannot delete tournament that has already started');
+    }
+
+    await this.prisma.tournament.delete({
+      where: { id: tournamentId },
+    });
+
+    return { success: true, message: 'Tournament deleted successfully' };
+  }
+
+  // Cleanup stale tournaments (can be called by a cron job)
+  async cleanupStaleTournaments() {
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Delete pending tournaments with no players that are older than 1 day
+    const emptyTournaments = await this.prisma.tournament.findMany({
+      where: {
+        status: TournamentStatus.PENDING,
+        createdAt: {
+          lt: oneDayAgo,
+        },
+        players: {
+          none: {},
+        },
+      },
+    });
+
+    if (emptyTournaments.length > 0) {
+      await this.prisma.tournament.deleteMany({
+        where: {
+          id: {
+            in: emptyTournaments.map((t) => t.id),
+          },
+        },
+      });
+
+      console.log(`Cleaned up ${emptyTournaments.length} stale tournaments`);
+    }
+
+    return {
+      cleaned: emptyTournaments.length,
+      tournaments: emptyTournaments,
+    };
+  }
 }
