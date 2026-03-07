@@ -38,6 +38,7 @@ export class GameService {
     };
 
     this.rooms.set(roomId, room);
+    console.log(`🎮 Room created: ${roomId} by player ${playerId}`);
     return room;
   }
 
@@ -46,6 +47,13 @@ export class GameService {
     let room = this.rooms.get(roomId);
 
     if (room) {
+      console.log(`Room ${roomId} found in memory. Players: ${room.players.length}`);
+      room.players.forEach((p, idx) => {
+        console.log(
+          `  Player ${idx}: id=${p.id}, role=${p.role}, socketId=${p.socketId || '(empty)'}`,
+        );
+      });
+
       // Room exists - check if player is already in it (reconnecting or tournament game)
       const existingPlayer = room.players.find((p) => p.socketId === socketId || p.id === playerId);
 
@@ -59,23 +67,18 @@ export class GameService {
         return room;
       }
 
-      // For tournament games, check if this player matches one of the pre-assigned slots
-      const matchingPlayer = room.players.find((p) => {
-        // Extract username from player ID (database ID format is different)
-        // We need to check if this is their assigned slot
-        return p.socketId === '' && p.id !== playerId;
-      });
+      // Check if room is full (both slots taken by connected players)
+      const connectedPlayers = room.players.filter((p) => p.socketId !== '').length;
+      console.log(`Connected players: ${connectedPlayers}, Total players: ${room.players.length}`);
 
-      if (matchingPlayer && room.players.length === 2) {
-        // This might be a tournament game - check if username matches
-        // We'll let the database check below handle this
-        console.log(`Room has 2 players but checking if this is a tournament game assignment`);
-      } else if (room.players.length >= 2) {
-        // Regular game that's full
-        console.log(`Room ${roomId} is full with ${room.players.length} players`);
+      if (room.players.length >= 2 && connectedPlayers >= 2) {
+        // Both slots taken and both players connected
+        console.log(`Room ${roomId} is full with 2 connected players`);
         return null;
-      } else {
-        // Add as second player in regular game
+      }
+
+      if (room.players.length === 1) {
+        // Only one player in room - add second player
         const player: Player = {
           id: playerId,
           role: 'two',
@@ -88,6 +91,10 @@ export class GameService {
         console.log(`Player ${playerId} joined existing room ${roomId} as player two`);
         return room;
       }
+
+      // If we get here, room has 2 players but at least one is disconnected
+      // Check if this is a tournament game
+      console.log(`Room has 2 players, checking if tournament game...`);
     }
 
     // Check if it's a tournament game in the database
