@@ -1,0 +1,102 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Player {
+  id                String             @id @default(cuid())
+  username          String             @unique
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  gamesAsPlayerOne  Game[]             @relation("PlayerOneGames")
+  gamesAsPlayerTwo  Game[]             @relation("PlayerTwoGames")
+  tournamentPlayers TournamentPlayer[]
+
+  @@map("players")
+}
+
+model Tournament {
+  id           String             @id @default(cuid())
+  name         String
+  status       TournamentStatus   @default(PENDING)
+  maxPlayers   Int
+  currentRound Int                @default(0)
+  creatorId    String?
+  isPrivate    Boolean            @default(false)
+  inviteCode   String?            @unique
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  startedAt    DateTime?
+  completedAt  DateTime?
+  winnerId     String?
+  games        Game[]
+  players      TournamentPlayer[]
+
+  @@map("tournaments")
+}
+
+model TournamentPlayer {
+  id           String     @id @default(cuid())
+  tournamentId String
+  playerId     String
+  seed         Int
+  isEliminated Boolean    @default(false)
+  hasBye       Boolean    @default(false)
+  joinedAt     DateTime   @default(now())
+  player       Player     @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  tournament   Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  @@unique([tournamentId, playerId])
+  @@map("tournament_players")
+}
+
+model Game {
+  id           String      @id @default(cuid())
+  tournamentId String?
+  playerOneId  String
+  playerTwoId  String
+  winnerId     String?
+  isDraw       Boolean     @default(false)
+  status       GameStatus  @default(IN_PROGRESS)
+  round        Int?
+  boardState   Json?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  completedAt  DateTime?
+  playerOne    Player      @relation("PlayerOneGames", fields: [playerOneId], references: [id])
+  playerTwo    Player      @relation("PlayerTwoGames", fields: [playerTwoId], references: [id])
+  tournament   Tournament? @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  moves        Move[]
+
+  @@map("games")
+}
+
+model Move {
+  id          String   @id @default(cuid())
+  gameId      String
+  playerId    String
+  columnIndex Int
+  rowIndex    Int
+  moveNumber  Int
+  createdAt   DateTime @default(now())
+  game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@map("moves")
+}
+
+enum TournamentStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum GameStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}

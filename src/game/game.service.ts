@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
 import {
   GameRoom,
   GameBoard,
@@ -13,6 +14,8 @@ export class GameService {
   private rooms: Map<string, GameRoom> = new Map();
   private readonly ROWS = 6;
   private readonly COLS = 7;
+
+  constructor(private readonly prisma: PrismaService) {}
 
   createRoom(playerId: string, socketId: string): GameRoom {
     const roomId = this.generateRoomId();
@@ -38,22 +41,156 @@ export class GameService {
     return room;
   }
 
-  joinRoom(roomId: string, playerId: string, socketId: string): GameRoom | null {
-    const room = this.rooms.get(roomId);
-    if (!room || room.players.length >= 2) {
-      return null;
+  async joinRoom(roomId: string, playerId: string, socketId: string): Promise<GameRoom | null> {
+    // First check if room already exists in memory
+    let room = this.rooms.get(roomId);
+
+    if (room) {
+      // Room exists - check if player is already in it (reconnecting or tournament game)
+      const existingPlayer = room.players.find((p) => p.socketId === socketId || p.id === playerId);
+
+      if (existingPlayer) {
+        // Player reconnecting or joining their assigned slot - update socket ID
+        existingPlayer.socketId = socketId;
+        this.rooms.set(roomId, room);
+        console.log(
+          `Player ${playerId} reconnected to room ${roomId} as player ${existingPlayer.role}`,
+        );
+        return room;
+      }
+
+      // For tournament games, check if this player matches one of the pre-assigned slots
+      const matchingPlayer = room.players.find((p) => {
+        // Extract username from player ID (database ID format is different)
+        // We need to check if this is their assigned slot
+        return p.socketId === '' && p.id !== playerId;
+      });
+
+      if (matchingPlayer && room.players.length === 2) {
+        // This might be a tournament game - check if username matches
+        // We'll let the database check below handle this
+        console.log(`Room has 2 players but checking if this is a tournament game assignment`);
+      } else if (room.players.length >= 2) {
+        // Regular game that's full
+        console.log(`Room ${roomId} is full with ${room.players.length} players`);
+        return null;
+      } else {
+        // Add as second player in regular game
+        const player: Player = {
+          id: playerId,
+          role: 'two',
+          color: 'yellow',
+          socketId,
+        };
+
+        room.players.push(player);
+        this.rooms.set(roomId, room);
+        console.log(`Player ${playerId} joined existing room ${roomId} as player two`);
+        return room;
+      }
     }
 
-    const player: Player = {
-      id: playerId,
-      role: 'two',
-      color: 'yellow',
-      socketId,
-    };
+    // Check if it's a tournament game in the database
+    try {
+      const dbGame = await this.prisma.game.findUnique({
+        where: { id: roomId },
+        include: {
+          playerOne: true,
+          playerTwo: true,
+        },
+      });
 
-    room.players.push(player);
-    this.rooms.set(roomId, room);
-    return room;
+      if (dbGame && dbGame.status === 'IN_PROGRESS') {
+        console.log(`Loading tournament game ${roomId} from database`);
+        console.log(`Player One: ${dbGame.playerOne.username} (${dbGame.playerOneId})`);
+        console.log(`Player Two: ${dbGame.playerTwo.username} (${dbGame.playerTwoId})`);
+        console.log(`Joining player ID: ${playerId}`);
+
+        // Check if room already exists (might have been created by first player)
+        room = this.rooms.get(roomId);
+
+        if (room) {
+          // Room exists, find the matching player slot by username
+          const usernameFromPlayerId = playerId.split('_')[1];
+
+          if (usernameFromPlayerId === dbGame.playerOne.username) {
+            const player1 = room.players.find((p) => p.role === 'one');
+            if (player1) {
+              player1.socketId = socketId;
+              player1.id = playerId; // Update with the actual playerId
+              this.rooms.set(roomId, room);
+              console.log(`Matched to Player One by username: ${usernameFromPlayerId}`);
+              return room;
+            }
+          } else if (usernameFromPlayerId === dbGame.playerTwo.username) {
+            const player2 = room.players.find((p) => p.role === 'two');
+            if (player2) {
+              player2.socketId = socketId;
+              player2.id = playerId; // Update with the actual playerId
+              this.rooms.set(roomId, room);
+              console.log(`Matched to Player Two by username: ${usernameFromPlayerId}`);
+              return room;
+            }
+          }
+
+          console.log(`Could not match username ${usernameFromPlayerId} to either player`);
+          return null;
+        }
+
+        // Create new room for tournament game
+        const gameRoom: GameRoom = {
+          id: dbGame.id,
+          players: [],
+          board: dbGame.boardState ? (dbGame.boardState as GameBoard) : this.createEmptyBoard(),
+          currentTurn: 'one',
+          winner: null,
+          winningLine: null,
+          isDraw: dbGame.isDraw,
+          createdAt: dbGame.createdAt,
+        };
+
+        // Create player slots with database IDs
+        const player1: Player = {
+          id: dbGame.playerOneId,
+          role: 'one',
+          color: 'red',
+          socketId: '',
+        };
+
+        const player2: Player = {
+          id: dbGame.playerTwoId,
+          role: 'two',
+          color: 'yellow',
+          socketId: '',
+        };
+
+        gameRoom.players.push(player1, player2);
+
+        // Determine which player is joining by checking username in playerId
+        // playerId format: player_username_randomid
+        const usernameFromPlayerId = playerId.split('_')[1];
+
+        if (usernameFromPlayerId === dbGame.playerOne.username) {
+          gameRoom.players[0].socketId = socketId;
+          gameRoom.players[0].id = playerId; // Use the generated playerId
+          console.log(`Matched to Player One by username: ${usernameFromPlayerId}`);
+        } else if (usernameFromPlayerId === dbGame.playerTwo.username) {
+          gameRoom.players[1].socketId = socketId;
+          gameRoom.players[1].id = playerId; // Use the generated playerId
+          console.log(`Matched to Player Two by username: ${usernameFromPlayerId}`);
+        } else {
+          console.log(`Could not match username ${usernameFromPlayerId} to either player`);
+          return null;
+        }
+
+        this.rooms.set(roomId, gameRoom);
+        return gameRoom;
+      }
+    } catch (error) {
+      console.error('Error checking database for game:', error);
+    }
+
+    return null;
   }
 
   getRoom(roomId: string): GameRoom | null {
@@ -157,6 +294,8 @@ export class GameService {
       winner: room.winner,
       winningLine: room.winningLine,
       isDraw: room.isDraw,
+      columnIndex,
+      rowIndex: targetRow,
     };
   }
 
@@ -195,17 +334,24 @@ export class GameService {
     for (const [roomId, room] of this.rooms.entries()) {
       const playerIndex = room.players.findIndex((p) => p.socketId === socketId);
       if (playerIndex !== -1) {
-        room.players.splice(playerIndex, 1);
+        // Mark player as disconnected but don't remove them yet (allow reconnect)
+        room.players[playerIndex].socketId = '';
 
-        if (room.players.length === 0) {
+        if (room.players.length === 0 || room.players.every((p) => p.socketId === '')) {
           this.rooms.delete(roomId);
           return { roomId, remainingPlayers: 0 };
         }
 
-        return { roomId, remainingPlayers: room.players.length };
+        const connectedPlayers = room.players.filter((p) => p.socketId !== '').length;
+        return { roomId, remainingPlayers: connectedPlayers };
       }
     }
     return null;
+  }
+
+  removeRoom(roomId: string): void {
+    this.rooms.delete(roomId);
+    console.log(`Room ${roomId} removed`);
   }
 
   private createEmptyBoard(): GameBoard {

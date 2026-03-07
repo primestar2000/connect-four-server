@@ -58,5 +58,7 @@ export interface MoveResult {
   winner: PlayerRole | null;
   winningLine: [number, number][] | null;
   isDraw: boolean;
+  columnIndex?: number;
+  rowIndex?: number;
   error?: string;
 }
