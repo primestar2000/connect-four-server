@@ -9,6 +9,7 @@ interface CreateTournamentDto {
   isPrivate?: boolean;
   avatar?: string;
   avatarType?: string;
+  moveTimeoutSeconds?: number;
 }
 
 interface JoinTournamentDto {
@@ -27,6 +28,12 @@ export class TournamentService {
     // Validate max players (must be power of 2 for single elimination)
     if (!this.isPowerOfTwo(data.maxPlayers)) {
       throw new Error('Max players must be a power of 2 (2, 4, 8, 16, 32, 64)');
+    }
+
+    // Validate move timeout
+    const moveTimeoutSeconds = data.moveTimeoutSeconds || 30; // Default 30 seconds
+    if (moveTimeoutSeconds < 10 || moveTimeoutSeconds > 120) {
+      throw new Error('Move timeout must be between 10 and 120 seconds');
     }
 
     // Generate invite code for private tournaments
@@ -61,6 +68,7 @@ export class TournamentService {
         creatorId: data.creatorId,
         isPrivate: data.isPrivate || false,
         inviteCode,
+        moveTimeoutSeconds,
         players: {
           create: {
             playerId: player.id,
@@ -294,8 +302,10 @@ export class TournamentService {
         },
       });
       games.push(game);
-      
-      console.log(`Created tournament game ${game.id} for round ${round}: ${game.playerOne.username} vs ${game.playerTwo.username}`);
+
+      console.log(
+        `Created tournament game ${game.id} for round ${round}: ${game.playerOne.username} vs ${game.playerTwo.username}`,
+      );
     }
 
     return games;
@@ -356,7 +366,7 @@ export class TournamentService {
 
       // Check if round is complete and return the result
       const roundResult = await this.checkRoundComplete(game.tournamentId, game.round!);
-      
+
       return {
         game: await this.prisma.game.findUnique({
           where: { id: gameId },
@@ -387,7 +397,7 @@ export class TournamentService {
       // Check if round is complete
       if (game.round) {
         const roundResult = await this.checkRoundComplete(game.tournamentId, game.round);
-        
+
         return {
           game: await this.prisma.game.findUnique({
             where: { id: gameId },
@@ -415,7 +425,10 @@ export class TournamentService {
     };
   }
 
-  async checkRoundComplete(tournamentId: string, round: number): Promise<{ roundComplete: boolean; tournamentComplete: boolean; nextRound?: number }> {
+  async checkRoundComplete(
+    tournamentId: string,
+    round: number,
+  ): Promise<{ roundComplete: boolean; tournamentComplete: boolean; nextRound?: number }> {
     const tournament = await this.prisma.tournament.findUnique({
       where: { id: tournamentId },
       include: {
@@ -504,7 +517,7 @@ export class TournamentService {
     // Generate next round matchups
     const newGames = await this.generateRoundMatchups(tournamentId, nextRound);
     console.log(`Generated ${newGames.length} games for round ${nextRound}`);
-    
+
     return { roundComplete: true, tournamentComplete: false, nextRound };
   }
 
@@ -761,10 +774,14 @@ export class TournamentService {
 
     // Determine winner (the player who is NOT absent)
     const winnerId = absentPlayerId === game.playerOneId ? game.playerTwoId : game.playerOneId;
-    const winnerName = winnerId === game.playerOneId ? game.playerOne.username : game.playerTwo.username;
-    const loserName = absentPlayerId === game.playerOneId ? game.playerOne.username : game.playerTwo.username;
+    const winnerName =
+      winnerId === game.playerOneId ? game.playerOne.username : game.playerTwo.username;
+    const loserName =
+      absentPlayerId === game.playerOneId ? game.playerOne.username : game.playerTwo.username;
 
-    console.log(`Tournament game ${gameId} forfeit: ${loserName} failed to join, ${winnerName} wins by forfeit`);
+    console.log(
+      `Tournament game ${gameId} forfeit: ${loserName} failed to join, ${winnerName} wins by forfeit`,
+    );
 
     // Complete the game with forfeit
     await this.completeGame(gameId, winnerId, false);

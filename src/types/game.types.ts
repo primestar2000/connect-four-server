@@ -2,6 +2,24 @@ export type CellColor = 'red' | 'yellow' | null;
 export type PlayerRole = 'one' | 'two';
 export type GameBoard = CellColor[][];
 
+// Move timer configuration constants
+export const MOVE_TIMEOUT = {
+  DEFAULT_CASUAL: 60, // 1 minute
+  DEFAULT_MATCHMAKING: 45, // 45 seconds
+  DEFAULT_TOURNAMENT: 30, // 30 seconds
+  MIN: 10, // 10 seconds minimum
+  MAX: 120, // 2 minutes maximum
+
+  // Grace periods for disconnection (milliseconds)
+  GRACE_PERIOD_CASUAL: 30000, // 30 seconds
+  GRACE_PERIOD_TOURNAMENT: 15000, // 15 seconds
+  GRACE_PERIOD_MATCHMAKING: 20000, // 20 seconds
+
+  // Warning thresholds (seconds)
+  WARNING_THRESHOLD: 10, // Show warning at 10s
+  CRITICAL_THRESHOLD: 5, // Critical warning at 5s
+};
+
 export interface Player {
   id: string; // token
   username: string;
@@ -21,6 +39,12 @@ export interface GameRoom {
   winningLine: [number, number][] | null;
   isDraw: boolean;
   createdAt: Date;
+
+  // Timer fields
+  moveTimer?: NodeJS.Timeout;
+  moveStartTime?: Date;
+  moveTimeoutSeconds?: number;
+  tournamentId?: string;
 }
 
 export interface CreateRoomResponse {

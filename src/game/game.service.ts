@@ -11,8 +11,8 @@ import {
 
 @Injectable()
 export class GameService {
-  private rooms: Map<string, GameRoom> = new Map();
-  private forfeitTimers: Map<string, NodeJS.Timeout> = new Map();
+  private readonly rooms: Map<string, GameRoom> = new Map();
+  private readonly forfeitTimers: Map<string, NodeJS.Timeout> = new Map();
   private readonly ROWS = 6;
   private readonly COLS = 7;
   private readonly TOURNAMENT_JOIN_TIMEOUT = 120000; // 2 minutes for players to join tournament game
@@ -31,7 +31,10 @@ export class GameService {
       where: { token: playerId },
     });
 
-    console.log('🔍 [DEBUG] Database lookup result:', dbPlayer ? `Found: ${dbPlayer.username}` : 'NOT FOUND');
+    console.log(
+      '🔍 [DEBUG] Database lookup result:',
+      dbPlayer ? `Found: ${dbPlayer.username}` : 'NOT FOUND',
+    );
 
     if (!dbPlayer) {
       throw new Error('Player not found. Please create a profile first.');
@@ -139,6 +142,7 @@ export class GameService {
         include: {
           playerOne: true,
           playerTwo: true,
+          tournament: true,
         },
       });
 
@@ -212,6 +216,15 @@ export class GameService {
         }
 
         // Create new room for tournament game
+        // Get tournament timeout if this is a tournament game
+        let tournamentTimeout = 30; // Default
+        if (dbGame.tournamentId) {
+          const tournament = await this.prisma.tournament.findUnique({
+            where: { id: dbGame.tournamentId },
+          });
+          tournamentTimeout = tournament?.moveTimeoutSeconds ?? 30;
+        }
+
         const gameRoom: GameRoom = {
           id: dbGame.id,
           players: [],
@@ -221,6 +234,8 @@ export class GameService {
           winningLine: null,
           isDraw: dbGame.isDraw,
           createdAt: dbGame.createdAt,
+          tournamentId: dbGame.tournamentId ?? undefined,
+          moveTimeoutSeconds: tournamentTimeout,
         };
 
         // Create player slots with tokens as IDs (for socket communication)
@@ -352,6 +367,9 @@ export class GameService {
     // Make the move
     room.board[targetRow][columnIndex] = player.color;
 
+    // Clear move timer since move was made
+    this.clearMoveTimer(roomId);
+
     // Check for winner
     const winResult = this.checkWinner(room.board);
     if (winResult) {
@@ -459,6 +477,7 @@ export class GameService {
   }
 
   removeRoom(roomId: string): void {
+    this.clearMoveTimer(roomId);
     this.rooms.delete(roomId);
     this.clearForfeitTimer(roomId);
     console.log(`Room ${roomId} removed`);
@@ -490,6 +509,97 @@ export class GameService {
 
     this.forfeitTimers.set(roomId, timer);
     console.log(`Set forfeit timer for room ${roomId} (${timeout}ms)`);
+  }
+
+  /**
+   * Start move timer for a game
+   */
+  startMoveTimer(roomId: string, timeoutSeconds: number, onTimeout: () => void): void {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+
+    // Clear any existing timer
+    this.clearMoveTimer(roomId);
+
+    // Set move start time
+    room.moveStartTime = new Date();
+    room.moveTimeoutSeconds = timeoutSeconds;
+
+    // Start timer
+    room.moveTimer = setTimeout(() => {
+      console.log(`⏰ Move timeout for room ${roomId}`);
+      onTimeout();
+    }, timeoutSeconds * 1000);
+
+    this.rooms.set(roomId, room);
+    console.log(`⏱️ Started ${timeoutSeconds}s move timer for room ${roomId}`);
+  }
+
+  /**
+   * Clear move timer for a game
+   */
+  clearMoveTimer(roomId: string): void {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+
+    if (room.moveTimer) {
+      clearTimeout(room.moveTimer);
+      room.moveTimer = undefined;
+      room.moveStartTime = undefined;
+      console.log(`⏱️ Cleared move timer for room ${roomId}`);
+    }
+  }
+
+  /**
+   * Get remaining time for current move
+   */
+  getRemainingTime(roomId: string): number | null {
+    const room = this.rooms.get(roomId);
+    if (!room || !room.moveStartTime || !room.moveTimeoutSeconds) {
+      return null;
+    }
+
+    const elapsed = Date.now() - room.moveStartTime.getTime();
+    const remaining = room.moveTimeoutSeconds * 1000 - elapsed;
+    return Math.max(0, Math.ceil(remaining / 1000)); // Return seconds
+  }
+
+  /**
+   * Pause move timer (for disconnections)
+   */
+  pauseMoveTimer(roomId: string): number | null {
+    const room = this.rooms.get(roomId);
+    if (!room || !room.moveTimer) return null;
+
+    const remaining = this.getRemainingTime(roomId);
+    this.clearMoveTimer(roomId);
+
+    console.log(`⏸️ Paused move timer for room ${roomId}, ${remaining}s remaining`);
+    return remaining;
+  }
+
+  /**
+   * Resume move timer (after reconnection)
+   */
+  resumeMoveTimer(roomId: string, remainingSeconds: number, onTimeout: () => void): void {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+
+    // Clear any existing timer
+    this.clearMoveTimer(roomId);
+
+    // Set new start time based on remaining time
+    room.moveStartTime = new Date();
+    room.moveTimeoutSeconds = remainingSeconds;
+
+    // Start timer with remaining time
+    room.moveTimer = setTimeout(() => {
+      console.log(`⏰ Move timeout for room ${roomId} (resumed)`);
+      onTimeout();
+    }, remainingSeconds * 1000);
+
+    this.rooms.set(roomId, room);
+    console.log(`▶️ Resumed move timer for room ${roomId}, ${remainingSeconds}s remaining`);
   }
 
   private createEmptyBoard(): GameBoard {

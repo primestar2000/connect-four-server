@@ -26,21 +26,22 @@ model Player {
 }
 
 model Tournament {
-  id           String             @id @default(cuid())
-  name         String
-  status       TournamentStatus   @default(PENDING)
-  maxPlayers   Int
-  currentRound Int                @default(0)
-  creatorId    String?
-  isPrivate    Boolean            @default(false)
-  inviteCode   String?            @unique
-  createdAt    DateTime           @default(now())
-  updatedAt    DateTime           @updatedAt
-  startedAt    DateTime?
-  completedAt  DateTime?
-  winnerId     String?
-  games        Game[]
-  players      TournamentPlayer[]
+  id                 String             @id @default(cuid())
+  name               String
+  status             TournamentStatus   @default(PENDING)
+  maxPlayers         Int
+  currentRound       Int                @default(0)
+  moveTimeoutSeconds Int                @default(30) // Seconds per move (10-120)
+  creatorId          String?
+  isPrivate          Boolean            @default(false)
+  inviteCode         String?            @unique
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  startedAt          DateTime?
+  completedAt        DateTime?
+  winnerId           String?
+  games              Game[]
+  players            TournamentPlayer[]
 
   @@map("tournaments")
 }
