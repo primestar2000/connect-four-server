@@ -88,10 +88,20 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
                   console.log(`Tournament game completed. Winner: ${winnerDbId}`);
 
-                  // Notify tournament gateway to broadcast updates
-                  this.server.emit('tournamentUpdated', {
-                    tournamentId: dbGame.tournamentId,
-                  });
+                  // Get updated tournament data and broadcast
+                  const updatedTournament = await this.tournamentService.getTournament(dbGame.tournamentId);
+                  if (updatedTournament) {
+                    console.log('📢 Broadcasting tournament update after game completion');
+                    console.log('Tournament players:', updatedTournament.players.map(p => ({
+                      username: p.player.username,
+                      isEliminated: p.isEliminated,
+                      hasBye: p.hasBye,
+                    })));
+                    
+                    this.server.to(`tournament:${dbGame.tournamentId}`).emit('tournamentUpdated', {
+                      tournament: updatedTournament,
+                    });
+                  }
                 }
               } catch (error) {
                 console.error('Error completing tournament game on forfeit:', error);
@@ -130,9 +140,13 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
                 // Mark as draw or handle according to rules
                 await this.tournamentService.completeGame(result.roomId, null, true);
 
-                this.server.emit('tournamentUpdated', {
-                  tournamentId: dbGame.tournamentId,
-                });
+                // Get updated tournament data and broadcast
+                const updatedTournament = await this.tournamentService.getTournament(dbGame.tournamentId);
+                if (updatedTournament) {
+                  this.server.to(`tournament:${dbGame.tournamentId}`).emit('tournamentUpdated', {
+                    tournament: updatedTournament,
+                  });
+                }
               }
             } catch (error) {
               console.error('Error handling both players disconnect:', error);
@@ -149,22 +163,29 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('createRoom')
-  handleCreateRoom(
+  async handleCreateRoom(
     @MessageBody() data: { playerId?: string },
     @ConnectedSocket() client: Socket,
-  ): CreateRoomResponse {
+  ): Promise<CreateRoomResponse | { error: string }> {
     const playerId = data.playerId || this.generatePlayerId();
-    const room = this.gameService.createRoom(playerId, client.id);
 
-    client.join(room.id);
+    try {
+      const room = await this.gameService.createRoom(playerId, client.id);
 
-    console.log(`Room created: ${room.id} by player ${playerId}`);
+      client.join(room.id);
 
-    return {
-      roomId: room.id,
-      playerId,
-      playerRole: 'one',
-    };
+      console.log(`Room created: ${room.id} by player ${playerId}`);
+
+      return {
+        roomId: room.id,
+        playerId,
+        playerRole: 'one',
+      };
+    } catch (error: unknown) {
+      console.error('Error creating room:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to create room';
+      return { error: errorMessage };
+    }
   }
 
   @SubscribeMessage('joinRoom')
@@ -185,7 +206,10 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.join(room.id);
     console.log(`[joinRoom] Player ${playerId} joined socket room ${room.id}`);
 
-    const gameState = this.gameService.getGameState(room.id);
+    // Clear any pending forfeit timer for this game
+    this.gameService.clearForfeitTimer(room.id);
+
+    const gameState = await this.gameService.getGameState(room.id);
     if (!gameState) {
       console.log(`[joinRoom] Failed to get game state for room ${room.id}`);
       return { error: 'Failed to get game state' };
@@ -214,7 +238,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('makeMove')
-  handleMakeMove(@MessageBody() data: MakeMovePayload): MoveResult {
+  async handleMakeMove(@MessageBody() data: MakeMovePayload): Promise<MoveResult> {
     const result = this.gameService.makeMove(data.roomId, data.playerId, data.columnIndex);
 
     if (result.success) {
@@ -228,17 +252,100 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
         columnIndex: result.columnIndex,
         rowIndex: result.rowIndex,
       });
+
+      // If game ended (winner or draw), handle tournament completion
+      if (result.winner || result.isDraw) {
+        console.log(`Game ${data.roomId} ended. Winner: ${result.winner}, Draw: ${result.isDraw}`);
+        
+        try {
+          // Check if this is a tournament game
+          const dbGame = await this.tournamentService['prisma'].game.findUnique({
+            where: { id: data.roomId },
+            include: { tournament: true, playerOne: true, playerTwo: true },
+          });
+
+          if (dbGame?.tournamentId) {
+            console.log(`Tournament game ${data.roomId} completed`);
+            
+            // Determine winner database ID
+            let winnerDbId: string | null = null;
+            if (result.winner) {
+              const room = this.gameService.getRoom(data.roomId);
+              if (room) {
+                const winningPlayer = room.players.find(p => p.role === result.winner);
+                if (winningPlayer) {
+                  // Look up database ID from token
+                  const dbPlayer = await this.tournamentService['prisma'].player.findUnique({
+                    where: { token: winningPlayer.id },
+                  });
+                  if (dbPlayer) {
+                    winnerDbId = dbPlayer.id;
+                  }
+                }
+              }
+            }
+
+            // Complete the tournament game
+            const completionResult = await this.tournamentService.completeGame(data.roomId, winnerDbId, result.isDraw);
+            
+            console.log(`Tournament game completed. Winner DB ID: ${winnerDbId}, Draw: ${result.isDraw}`);
+            console.log(`Round complete: ${completionResult.roundResult.roundComplete}, Tournament complete: ${completionResult.roundResult.tournamentComplete}`);
+
+            // Get updated tournament and broadcast to all tournament participants
+            const updatedTournament = await this.tournamentService.getTournament(dbGame.tournamentId);
+            if (updatedTournament) {
+              console.log('📢 Broadcasting tournament update after game completion');
+              console.log('Tournament status:', updatedTournament.status);
+              console.log('Current round:', updatedTournament.currentRound);
+              console.log('Tournament players:', updatedTournament.players.map(p => ({
+                username: p.player.username,
+                isEliminated: p.isEliminated,
+                hasBye: p.hasBye,
+              })));
+              
+              this.server.to(`tournament:${dbGame.tournamentId}`).emit('tournamentUpdated', {
+                tournament: updatedTournament,
+              });
+
+              // Emit gameCompleted event
+              this.server.to(`tournament:${dbGame.tournamentId}`).emit('gameCompleted', {
+                tournament: updatedTournament,
+                gameId: data.roomId,
+              });
+
+              // If round completed, emit roundCompleted event
+              if (completionResult.roundResult.roundComplete && !completionResult.roundResult.tournamentComplete) {
+                console.log(`📢 Broadcasting round completion for round ${dbGame.round}`);
+                this.server.to(`tournament:${dbGame.tournamentId}`).emit('roundCompleted', {
+                  tournament: updatedTournament,
+                  round: dbGame.round,
+                });
+              }
+
+              // If tournament completed, emit tournamentCompleted event
+              if (completionResult.roundResult.tournamentComplete) {
+                console.log(`📢 Broadcasting tournament completion`);
+                this.server.to(`tournament:${dbGame.tournamentId}`).emit('tournamentCompleted', {
+                  tournament: updatedTournament,
+                });
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error completing tournament game:', error);
+        }
+      }
     }
 
     return result;
   }
 
   @SubscribeMessage('resetGame')
-  handleResetGame(@MessageBody() data: { roomId: string }): { success: boolean } {
+  async handleResetGame(@MessageBody() data: { roomId: string }): Promise<{ success: boolean }> {
     const success = this.gameService.resetGame(data.roomId);
 
     if (success) {
-      const gameState = this.gameService.getGameState(data.roomId);
+      const gameState = await this.gameService.getGameState(data.roomId);
       this.server.to(data.roomId).emit('gameReset', gameState);
     }
 
@@ -246,8 +353,10 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('getGameState')
-  handleGetGameState(@MessageBody() data: { roomId: string }): GameState | { error: string } {
-    const gameState = this.gameService.getGameState(data.roomId);
+  async handleGetGameState(
+    @MessageBody() data: { roomId: string },
+  ): Promise<GameState | { error: string }> {
+    const gameState = await this.gameService.getGameState(data.roomId);
 
     if (!gameState) {
       return { error: 'Room not found' };

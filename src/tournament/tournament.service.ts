@@ -7,12 +7,16 @@ interface CreateTournamentDto {
   maxPlayers: number;
   creatorId: string;
   isPrivate?: boolean;
+  avatar?: string;
+  avatarType?: string;
 }
 
 interface JoinTournamentDto {
   tournamentId: string;
   playerId: string;
   inviteCode?: string;
+  avatar?: string;
+  avatarType?: string;
 }
 
 @Injectable()
@@ -28,18 +32,22 @@ export class TournamentService {
     // Generate invite code for private tournaments
     const inviteCode = data.isPrivate ? this.generateInviteCode() : null;
 
-    // Extract username from creatorId (format: player_username_randomid)
-    const username = data.creatorId.split('_')[1] || data.creatorId;
-
-    // Create or get player
+    // Get player by token (creatorId is now the token)
     let player = await this.prisma.player.findUnique({
-      where: { username },
+      where: { token: data.creatorId },
     });
 
     if (!player) {
-      player = await this.prisma.player.create({
+      throw new Error('Player not found. Please create a profile first.');
+    }
+
+    // Update avatar if provided
+    if (data.avatar) {
+      player = await this.prisma.player.update({
+        where: { id: player.id },
         data: {
-          username,
+          avatar: data.avatar,
+          avatarType: data.avatarType || 'emoji',
         },
       });
     }
@@ -101,7 +109,11 @@ export class TournamentService {
     const tournament = await this.prisma.tournament.findUnique({
       where: { id: data.tournamentId },
       include: {
-        players: true,
+        players: {
+          include: {
+            player: true,
+          },
+        },
       },
     });
 
@@ -122,27 +134,34 @@ export class TournamentService {
       throw new Error('Tournament is full');
     }
 
-    // Check if player already joined
-    const existingPlayer = tournament.players.find((p) => p.playerId === data.playerId);
-
-    if (existingPlayer) {
-      throw new Error('Player already joined this tournament');
-    }
-
-    // Create or get player - extract username from playerId
-    // Format: player_username_randomid
-    const username = data.playerId.split('_')[1] || data.playerId;
-
+    // Get player by token (playerId is now the token)
     let player = await this.prisma.player.findUnique({
-      where: { username },
+      where: { token: data.playerId },
     });
 
     if (!player) {
-      player = await this.prisma.player.create({
+      throw new Error('Player not found. Please create a profile first.');
+    }
+
+    // Update avatar if provided
+    if (data.avatar) {
+      // Update avatar if provided
+      player = await this.prisma.player.update({
+        where: { id: player.id },
         data: {
-          username,
+          avatar: data.avatar,
+          avatarType: data.avatarType || 'emoji',
         },
       });
+    }
+
+    // Check if player already joined using database player ID
+    const existingPlayer = tournament.players.find((p) => p.playerId === player.id);
+
+    if (existingPlayer) {
+      // Player already in tournament - return current state
+      console.log(`Player ${player.username} already in tournament ${data.tournamentId}`);
+      return tournament;
     }
 
     // Add player to tournament using the database player ID
@@ -267,6 +286,7 @@ export class TournamentService {
           playerOneId: activePlayers[i].playerId,
           playerTwoId: activePlayers[i + 1].playerId,
           round,
+          status: 'IN_PROGRESS',
         },
         include: {
           playerOne: true,
@@ -274,6 +294,8 @@ export class TournamentService {
         },
       });
       games.push(game);
+      
+      console.log(`Created tournament game ${game.id} for round ${round}: ${game.playerOne.username} vs ${game.playerTwo.username}`);
     }
 
     return games;
@@ -332,8 +354,20 @@ export class TournamentService {
         `Tournament ${game.tournamentId}: Player ${loserId} eliminated, Player ${winnerId} advances`,
       );
 
-      // Check if round is complete
-      await this.checkRoundComplete(game.tournamentId, game.round!);
+      // Check if round is complete and return the result
+      const roundResult = await this.checkRoundComplete(game.tournamentId, game.round!);
+      
+      return {
+        game: await this.prisma.game.findUnique({
+          where: { id: gameId },
+          include: {
+            playerOne: true,
+            playerTwo: true,
+            tournament: true,
+          },
+        }),
+        roundResult,
+      };
     } else if (game.tournamentId && isDraw) {
       // Handle draw - eliminate both players or schedule rematch
       console.log(`Tournament game ${gameId} ended in draw - both players eliminated`);
@@ -352,21 +386,36 @@ export class TournamentService {
 
       // Check if round is complete
       if (game.round) {
-        await this.checkRoundComplete(game.tournamentId, game.round);
+        const roundResult = await this.checkRoundComplete(game.tournamentId, game.round);
+        
+        return {
+          game: await this.prisma.game.findUnique({
+            where: { id: gameId },
+            include: {
+              playerOne: true,
+              playerTwo: true,
+              tournament: true,
+            },
+          }),
+          roundResult,
+        };
       }
     }
 
-    return this.prisma.game.findUnique({
-      where: { id: gameId },
-      include: {
-        playerOne: true,
-        playerTwo: true,
-        tournament: true,
-      },
-    });
+    return {
+      game: await this.prisma.game.findUnique({
+        where: { id: gameId },
+        include: {
+          playerOne: true,
+          playerTwo: true,
+          tournament: true,
+        },
+      }),
+      roundResult: { roundComplete: false, tournamentComplete: false },
+    };
   }
 
-  async checkRoundComplete(tournamentId: string, round: number) {
+  async checkRoundComplete(tournamentId: string, round: number): Promise<{ roundComplete: boolean; tournamentComplete: boolean; nextRound?: number }> {
     const tournament = await this.prisma.tournament.findUnique({
       where: { id: tournamentId },
       include: {
@@ -383,7 +432,7 @@ export class TournamentService {
       },
     });
 
-    if (!tournament) return;
+    if (!tournament) return { roundComplete: false, tournamentComplete: false };
 
     // Check if all games in round are complete
     const allComplete = tournament.games.every((game) => game.status === 'COMPLETED');
@@ -392,7 +441,7 @@ export class TournamentService {
       `Tournament ${tournamentId} Round ${round}: ${tournament.games.filter((g) => g.status === 'COMPLETED').length}/${tournament.games.length} games complete`,
     );
 
-    if (!allComplete) return;
+    if (!allComplete) return { roundComplete: false, tournamentComplete: false };
 
     console.log(`Tournament ${tournamentId} Round ${round} complete!`);
 
@@ -413,7 +462,7 @@ export class TournamentService {
           winnerId: tournament.players[0].playerId,
         },
       });
-      return;
+      return { roundComplete: true, tournamentComplete: true };
     }
 
     // If no players left (all eliminated in draws), mark as completed with no winner
@@ -427,7 +476,7 @@ export class TournamentService {
           completedAt: new Date(),
         },
       });
-      return;
+      return { roundComplete: true, tournamentComplete: true };
     }
 
     // Start next round
@@ -455,6 +504,8 @@ export class TournamentService {
     // Generate next round matchups
     const newGames = await this.generateRoundMatchups(tournamentId, nextRound);
     console.log(`Generated ${newGames.length} games for round ${nextRound}`);
+    
+    return { roundComplete: true, tournamentComplete: false, nextRound };
   }
 
   async listTournaments() {
@@ -625,6 +676,106 @@ export class TournamentService {
     return {
       cleaned: emptyTournaments.length,
       tournaments: emptyTournaments,
+    };
+  }
+
+  // Get player's active tournament (not eliminated and tournament not completed)
+  async getPlayerActiveTournament(playerId: string) {
+    // Get player by token
+    const player = await this.prisma.player.findUnique({
+      where: { token: playerId },
+    });
+
+    if (!player) {
+      throw new Error('Player not found');
+    }
+
+    // Find active tournament where player is not eliminated
+    const tournamentPlayer = await this.prisma.tournamentPlayer.findFirst({
+      where: {
+        playerId: player.id,
+        isEliminated: false,
+        tournament: {
+          status: {
+            in: [TournamentStatus.PENDING, TournamentStatus.IN_PROGRESS],
+          },
+        },
+      },
+      include: {
+        tournament: {
+          include: {
+            players: {
+              include: {
+                player: true,
+              },
+              orderBy: {
+                seed: 'asc',
+              },
+            },
+            games: {
+              include: {
+                playerOne: true,
+                playerTwo: true,
+              },
+              orderBy: {
+                createdAt: 'desc',
+              },
+            },
+          },
+        },
+      },
+      orderBy: {
+        tournament: {
+          createdAt: 'desc',
+        },
+      },
+    });
+
+    if (!tournamentPlayer) {
+      return null;
+    }
+
+    return tournamentPlayer.tournament;
+  }
+
+  // Handle forfeit when player doesn't join tournament game in time
+  async forfeitTournamentGame(gameId: string, absentPlayerId: string) {
+    const game = await this.prisma.game.findUnique({
+      where: { id: gameId },
+      include: {
+        tournament: true,
+        playerOne: true,
+        playerTwo: true,
+      },
+    });
+
+    if (!game || !game.tournamentId) {
+      console.error(`Game ${gameId} not found or not a tournament game`);
+      return null;
+    }
+
+    if (game.status === 'COMPLETED') {
+      console.log(`Game ${gameId} already completed`);
+      return null;
+    }
+
+    // Determine winner (the player who is NOT absent)
+    const winnerId = absentPlayerId === game.playerOneId ? game.playerTwoId : game.playerOneId;
+    const winnerName = winnerId === game.playerOneId ? game.playerOne.username : game.playerTwo.username;
+    const loserName = absentPlayerId === game.playerOneId ? game.playerOne.username : game.playerTwo.username;
+
+    console.log(`Tournament game ${gameId} forfeit: ${loserName} failed to join, ${winnerName} wins by forfeit`);
+
+    // Complete the game with forfeit
+    await this.completeGame(gameId, winnerId, false);
+
+    return {
+      gameId,
+      winnerId,
+      loserId: absentPlayerId,
+      winnerName,
+      loserName,
+      tournamentId: game.tournamentId,
     };
   }
 }

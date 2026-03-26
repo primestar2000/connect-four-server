@@ -9,7 +9,13 @@ datasource db {
 
 model Player {
   id                String             @id @default(cuid())
-  username          String             @unique
+  token             String             @unique @default(cuid()) // Anonymous token
+  username          String
+  avatar            String?
+  avatarType        String?            @default("emoji")
+  email             String?            @unique // For account linking
+  password          String? // Hashed password for registered accounts
+  isAnonymous       Boolean            @default(true)
   createdAt         DateTime           @default(now())
   updatedAt         DateTime           @updatedAt
   gamesAsPlayerOne  Game[]             @relation("PlayerOneGames")

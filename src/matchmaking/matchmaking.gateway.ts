@@ -62,7 +62,7 @@ export class MatchmakingGateway {
     };
   }
 
-  private processMatchmaking(): void {
+  private async processMatchmaking(): Promise<void> {
     const match = this.matchmakingService.findMatch();
 
     if (!match) {
@@ -72,10 +72,10 @@ export class MatchmakingGateway {
     const { player1, player2 } = match;
 
     // Create a game room
-    const room = this.gameService.createRoom(player1.playerId, player1.socketId);
+    const room = await this.gameService.createRoom(player1.playerId, player1.socketId);
 
     // Join player 2 to the room
-    const joinedRoom = this.gameService.joinRoom(room.id, player2.playerId, player2.socketId);
+    const joinedRoom = await this.gameService.joinRoom(room.id, player2.playerId, player2.socketId);
 
     if (!joinedRoom) {
       console.error('Failed to join player 2 to room');
@@ -83,7 +83,7 @@ export class MatchmakingGateway {
     }
 
     // Get game state
-    const gameState = this.gameService.getGameState(room.id);
+    const gameState = await this.gameService.getGameState(room.id);
 
     if (!gameState) {
       console.error('Failed to get game state');

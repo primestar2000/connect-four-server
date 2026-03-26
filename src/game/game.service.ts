@@ -12,15 +12,36 @@ import {
 @Injectable()
 export class GameService {
   private rooms: Map<string, GameRoom> = new Map();
+  private forfeitTimers: Map<string, NodeJS.Timeout> = new Map();
   private readonly ROWS = 6;
   private readonly COLS = 7;
+  private readonly TOURNAMENT_JOIN_TIMEOUT = 120000; // 2 minutes for players to join tournament game
 
   constructor(private readonly prisma: PrismaService) {}
 
-  createRoom(playerId: string, socketId: string): GameRoom {
+  async createRoom(playerId: string, socketId: string): Promise<GameRoom> {
     const roomId = this.generateRoomId();
+
+    console.log('🔍 [DEBUG] createRoom called');
+    console.log('🔍 [DEBUG] Received playerId (token):', playerId);
+    console.log('🔍 [DEBUG] Socket ID:', socketId);
+
+    // Look up player by token to get database ID
+    const dbPlayer = await this.prisma.player.findUnique({
+      where: { token: playerId },
+    });
+
+    console.log('🔍 [DEBUG] Database lookup result:', dbPlayer ? `Found: ${dbPlayer.username}` : 'NOT FOUND');
+
+    if (!dbPlayer) {
+      throw new Error('Player not found. Please create a profile first.');
+    }
+
     const player: Player = {
-      id: playerId,
+      id: playerId, // Keep token as id for socket communication
+      username: dbPlayer.username,
+      avatar: dbPlayer.avatar ?? undefined,
+      avatarType: dbPlayer.avatarType ?? undefined,
       role: 'one',
       color: 'red',
       socketId,
@@ -38,7 +59,7 @@ export class GameService {
     };
 
     this.rooms.set(roomId, room);
-    console.log(`🎮 Room created: ${roomId} by player ${playerId}`);
+    console.log(`🎮 Room created: ${roomId} by player ${dbPlayer.username} (token: ${playerId})`);
     return room;
   }
 
@@ -79,8 +100,20 @@ export class GameService {
 
       if (room.players.length === 1) {
         // Only one player in room - add second player
+        // Look up player by token to get database ID
+        const dbPlayer = await this.prisma.player.findUnique({
+          where: { token: playerId },
+        });
+
+        if (!dbPlayer) {
+          throw new Error('Player not found. Please create a profile first.');
+        }
+
         const player: Player = {
-          id: playerId,
+          id: playerId, // Keep token as id for socket communication
+          username: dbPlayer.username,
+          avatar: dbPlayer.avatar ?? undefined,
+          avatarType: dbPlayer.avatarType ?? undefined,
           role: 'two',
           color: 'yellow',
           socketId,
@@ -88,7 +121,9 @@ export class GameService {
 
         room.players.push(player);
         this.rooms.set(roomId, room);
-        console.log(`Player ${playerId} joined existing room ${roomId} as player two`);
+        console.log(
+          `Player ${dbPlayer.username} (token: ${playerId}) joined existing room ${roomId} as player two`,
+        );
         return room;
       }
 
@@ -111,36 +146,68 @@ export class GameService {
         console.log(`Loading tournament game ${roomId} from database`);
         console.log(`Player One: ${dbGame.playerOne.username} (${dbGame.playerOneId})`);
         console.log(`Player Two: ${dbGame.playerTwo.username} (${dbGame.playerTwoId})`);
-        console.log(`Joining player ID: ${playerId}`);
+        console.log(`Joining player token: ${playerId}`);
+
+        // Look up the joining player by token
+        const joiningPlayer = await this.prisma.player.findUnique({
+          where: { token: playerId },
+        });
+
+        if (!joiningPlayer) {
+          console.error(`Player with token ${playerId} not found`);
+          return null;
+        }
+
+        console.log(`Joining player: ${joiningPlayer.username} (DB ID: ${joiningPlayer.id})`);
+
+        // Check if player is in this game
+        if (joiningPlayer.id !== dbGame.playerOneId && joiningPlayer.id !== dbGame.playerTwoId) {
+          console.log(`Player ${joiningPlayer.username} (${joiningPlayer.id}) not in this game`);
+          console.log(`Expected: ${dbGame.playerOneId} or ${dbGame.playerTwoId}`);
+          return null;
+        }
+
+        // Check if player is eliminated from tournament
+        if (dbGame.tournamentId) {
+          const tournamentPlayer = await this.prisma.tournamentPlayer.findFirst({
+            where: {
+              tournamentId: dbGame.tournamentId,
+              playerId: joiningPlayer.id,
+            },
+          });
+
+          if (tournamentPlayer?.isEliminated) {
+            console.log(`Player ${joiningPlayer.username} is eliminated from tournament`);
+            return null;
+          }
+        }
 
         // Check if room already exists (might have been created by first player)
         room = this.rooms.get(roomId);
 
         if (room) {
-          // Room exists, find the matching player slot by username
-          const usernameFromPlayerId = playerId.split('_')[1];
-
-          if (usernameFromPlayerId === dbGame.playerOne.username) {
+          // Room exists, find the matching player slot by database ID
+          if (joiningPlayer.id === dbGame.playerOneId) {
             const player1 = room.players.find((p) => p.role === 'one');
             if (player1) {
               player1.socketId = socketId;
-              player1.id = playerId; // Update with the actual playerId
+              player1.id = playerId; // Update with the token
               this.rooms.set(roomId, room);
-              console.log(`Matched to Player One by username: ${usernameFromPlayerId}`);
+              console.log(`Matched to Player One: ${joiningPlayer.username}`);
               return room;
             }
-          } else if (usernameFromPlayerId === dbGame.playerTwo.username) {
+          } else if (joiningPlayer.id === dbGame.playerTwoId) {
             const player2 = room.players.find((p) => p.role === 'two');
             if (player2) {
               player2.socketId = socketId;
-              player2.id = playerId; // Update with the actual playerId
+              player2.id = playerId; // Update with the token
               this.rooms.set(roomId, room);
-              console.log(`Matched to Player Two by username: ${usernameFromPlayerId}`);
+              console.log(`Matched to Player Two: ${joiningPlayer.username}`);
               return room;
             }
           }
 
-          console.log(`Could not match username ${usernameFromPlayerId} to either player`);
+          console.log(`Player ${joiningPlayer.username} (${joiningPlayer.id}) not in this game`);
           return null;
         }
 
@@ -156,16 +223,22 @@ export class GameService {
           createdAt: dbGame.createdAt,
         };
 
-        // Create player slots with database IDs
+        // Create player slots with tokens as IDs (for socket communication)
         const player1: Player = {
-          id: dbGame.playerOneId,
+          id: dbGame.playerOneId, // Temporarily use DB ID, will be replaced with token when they join
+          username: dbGame.playerOne.username,
+          avatar: dbGame.playerOne.avatar ?? undefined,
+          avatarType: dbGame.playerOne.avatarType ?? undefined,
           role: 'one',
           color: 'red',
           socketId: '',
         };
 
         const player2: Player = {
-          id: dbGame.playerTwoId,
+          id: dbGame.playerTwoId, // Temporarily use DB ID, will be replaced with token when they join
+          username: dbGame.playerTwo.username,
+          avatar: dbGame.playerTwo.avatar ?? undefined,
+          avatarType: dbGame.playerTwo.avatarType ?? undefined,
           role: 'two',
           color: 'yellow',
           socketId: '',
@@ -173,24 +246,23 @@ export class GameService {
 
         gameRoom.players.push(player1, player2);
 
-        // Determine which player is joining by checking username in playerId
-        // playerId format: player_username_randomid
-        const usernameFromPlayerId = playerId.split('_')[1];
-
-        if (usernameFromPlayerId === dbGame.playerOne.username) {
+        // Determine which player is joining by matching database ID
+        if (joiningPlayer.id === dbGame.playerOneId) {
           gameRoom.players[0].socketId = socketId;
-          gameRoom.players[0].id = playerId; // Use the generated playerId
-          console.log(`Matched to Player One by username: ${usernameFromPlayerId}`);
-        } else if (usernameFromPlayerId === dbGame.playerTwo.username) {
+          gameRoom.players[0].id = playerId; // Use the token
+          console.log(`Matched to Player One: ${joiningPlayer.username}`);
+        } else if (joiningPlayer.id === dbGame.playerTwoId) {
           gameRoom.players[1].socketId = socketId;
-          gameRoom.players[1].id = playerId; // Use the generated playerId
-          console.log(`Matched to Player Two by username: ${usernameFromPlayerId}`);
+          gameRoom.players[1].id = playerId; // Use the token
+          console.log(`Matched to Player Two: ${joiningPlayer.username}`);
         } else {
-          console.log(`Could not match username ${usernameFromPlayerId} to either player`);
+          console.log(`Player ${joiningPlayer.username} (${joiningPlayer.id}) not in this game`);
+          console.log(`Expected: ${dbGame.playerOneId} or ${dbGame.playerTwoId}`);
           return null;
         }
 
         this.rooms.set(roomId, gameRoom);
+        console.log(`✅ Created tournament game room ${roomId} for ${joiningPlayer.username}`);
         return gameRoom;
       }
     } catch (error) {
@@ -320,9 +392,39 @@ export class GameService {
     return true;
   }
 
-  getGameState(roomId: string): GameState | null {
+  async getGameState(roomId: string): Promise<GameState | null> {
     const room = this.rooms.get(roomId);
     if (!room) return null;
+
+    // Look up player info from database by token
+    const getPlayerInfo = async (player: Player) => {
+      try {
+        const dbPlayer = await this.prisma.player.findUnique({
+          where: { token: player.id },
+          select: { username: true, avatar: true, avatarType: true },
+        });
+
+        return {
+          id: player.id,
+          connected: player.socketId !== '',
+          username: dbPlayer?.username || 'Unknown',
+          avatar: dbPlayer?.avatar ?? undefined,
+          avatarType: dbPlayer?.avatarType ?? undefined,
+        };
+      } catch (error) {
+        console.error(`Error looking up player ${player.id}:`, error);
+        return {
+          id: player.id,
+          connected: player.socketId !== '',
+          username: 'Unknown',
+        };
+      }
+    };
+
+    const [playerOne, playerTwo] = await Promise.all([
+      room.players[0] ? getPlayerInfo(room.players[0]) : Promise.resolve(null),
+      room.players[1] ? getPlayerInfo(room.players[1]) : Promise.resolve(null),
+    ]);
 
     return {
       board: room.board,
@@ -331,8 +433,8 @@ export class GameService {
       winningLine: room.winningLine,
       isDraw: room.isDraw,
       players: {
-        playerOne: room.players[0] ? { id: room.players[0].id, connected: true } : null,
-        playerTwo: room.players[1] ? { id: room.players[1].id, connected: true } : null,
+        playerOne,
+        playerTwo,
       },
     };
   }
@@ -358,7 +460,36 @@ export class GameService {
 
   removeRoom(roomId: string): void {
     this.rooms.delete(roomId);
+    this.clearForfeitTimer(roomId);
     console.log(`Room ${roomId} removed`);
+  }
+
+  clearForfeitTimer(roomId: string): void {
+    const timer = this.forfeitTimers.get(roomId);
+    if (timer) {
+      clearTimeout(timer);
+      this.forfeitTimers.delete(roomId);
+      console.log(`Cleared forfeit timer for room ${roomId}`);
+    }
+  }
+
+  setForfeitTimer(
+    roomId: string,
+    callback: () => void,
+    timeout: number = this.TOURNAMENT_JOIN_TIMEOUT,
+  ): void {
+    // Clear any existing timer
+    this.clearForfeitTimer(roomId);
+
+    // Set new timer
+    const timer = setTimeout(() => {
+      console.log(`Forfeit timer expired for room ${roomId}`);
+      callback();
+      this.forfeitTimers.delete(roomId);
+    }, timeout);
+
+    this.forfeitTimers.set(roomId, timer);
+    console.log(`Set forfeit timer for room ${roomId} (${timeout}ms)`);
   }
 
   private createEmptyBoard(): GameBoard {

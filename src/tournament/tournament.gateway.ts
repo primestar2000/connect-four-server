@@ -4,21 +4,28 @@ import {
   MessageBody,
   WebSocketServer,
   ConnectedSocket,
+  OnGatewayInit,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { TournamentService } from './tournament.service';
+import { GameService } from '../game/game.service';
+import { Inject, forwardRef } from '@nestjs/common';
 
 interface CreateTournamentPayload {
   name: string;
   maxPlayers: number;
   creatorId: string;
   isPrivate?: boolean;
+  avatar?: string;
+  avatarType?: string;
 }
 
 interface JoinTournamentPayload {
   tournamentId: string;
   playerId: string;
   inviteCode?: string;
+  avatar?: string;
+  avatarType?: string;
 }
 
 @WebSocketGateway({
@@ -26,11 +33,19 @@ interface JoinTournamentPayload {
     origin: '*',
   },
 })
-export class TournamentGateway {
+export class TournamentGateway implements OnGatewayInit {
   @WebSocketServer()
   server!: Server;
 
-  constructor(private readonly tournamentService: TournamentService) {}
+  constructor(
+    private readonly tournamentService: TournamentService,
+    @Inject(forwardRef(() => GameService))
+    private readonly gameService: GameService,
+  ) {}
+
+  afterInit() {
+    console.log('TournamentGateway initialized with GameService');
+  }
 
   @SubscribeMessage('createTournament')
   async handleCreateTournament(
@@ -93,6 +108,20 @@ export class TournamentGateway {
         this.server.to(`tournament:${tournament.id}`).emit('tournamentStarted', {
           tournament,
         });
+
+        // Set up forfeit timers for all games in the first round
+        if (tournament.games && tournament.games.length > 0) {
+          tournament.games.forEach((game) => {
+            if (game.round === 1 && game.status === 'IN_PROGRESS') {
+              this.setupGameForfeitTimer(
+                game.id,
+                game.playerOneId,
+                game.playerTwoId,
+                tournament.id,
+              );
+            }
+          });
+        }
       }
 
       return {
@@ -105,6 +134,96 @@ export class TournamentGateway {
         error: error instanceof Error ? error.message : 'Failed to start tournament',
       };
     }
+  }
+
+  // Set up forfeit timer for a tournament game
+  private setupGameForfeitTimer(
+    gameId: string,
+    playerOneId: string,
+    playerTwoId: string,
+    tournamentId: string,
+  ) {
+    if (!this.gameService) {
+      console.error('GameService not available for forfeit timer');
+      return;
+    }
+
+    const FORFEIT_TIMEOUT = 120000; // 2 minutes
+
+    this.gameService.setForfeitTimer(
+      gameId,
+      async () => {
+        console.log(`Forfeit timer expired for game ${gameId}`);
+
+        // Check if both players have joined
+        const room = this.gameService.getRoom(gameId);
+
+        if (!room) {
+          console.log(`Room ${gameId} not found, checking database...`);
+
+          // Game room doesn't exist - neither player joined
+          // Forfeit both players
+          await this.tournamentService.forfeitTournamentGame(gameId, playerOneId);
+          await this.tournamentService.forfeitTournamentGame(gameId, playerTwoId);
+
+          this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
+            tournamentId,
+            message: 'Game forfeited - neither player joined',
+          });
+
+          return;
+        }
+
+        // Check which players are connected
+        const player1Connected = room.players.some(
+          (p) => p.id === playerOneId && p.socketId !== '',
+        );
+        const player2Connected = room.players.some(
+          (p) => p.id === playerTwoId && p.socketId !== '',
+        );
+
+        if (!player1Connected && !player2Connected) {
+          // Neither player joined - both forfeit (draw/elimination)
+          console.log(`Neither player joined game ${gameId} - both forfeit`);
+          await this.tournamentService.forfeitTournamentGame(gameId, playerOneId);
+
+          this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
+            tournamentId,
+            message: 'Game forfeited - neither player joined',
+          });
+        } else if (!player1Connected) {
+          // Player 1 didn't join - player 2 wins
+          console.log(`Player 1 didn't join game ${gameId} - Player 2 wins by forfeit`);
+          const result = await this.tournamentService.forfeitTournamentGame(gameId, playerOneId);
+
+          if (result) {
+            this.server.to(gameId).emit('opponentForfeit', {
+              message: `${result.loserName} failed to join. ${result.winnerName} wins by forfeit!`,
+            });
+
+            this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
+              tournamentId,
+            });
+          }
+        } else if (!player2Connected) {
+          // Player 2 didn't join - player 1 wins
+          console.log(`Player 2 didn't join game ${gameId} - Player 1 wins by forfeit`);
+          const result = await this.tournamentService.forfeitTournamentGame(gameId, playerTwoId);
+
+          if (result) {
+            this.server.to(gameId).emit('opponentForfeit', {
+              message: `${result.loserName} failed to join. ${result.winnerName} wins by forfeit!`,
+            });
+
+            this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
+              tournamentId,
+            });
+          }
+        }
+        // If both players joined, timer is cleared automatically
+      },
+      FORFEIT_TIMEOUT,
+    );
   }
 
   @SubscribeMessage('getTournament')
@@ -193,6 +312,22 @@ export class TournamentGateway {
         tournament,
         round,
       });
+
+      // Set up forfeit timers for new round games
+      if (tournament.games && tournament.games.length > 0) {
+        const nextRound = round + 1;
+        const newRoundGames = tournament.games.filter(
+          (game) => game.round === nextRound && game.status === 'IN_PROGRESS',
+        );
+
+        console.log(
+          `Setting up forfeit timers for ${newRoundGames.length} games in round ${nextRound}`,
+        );
+
+        newRoundGames.forEach((game) => {
+          this.setupGameForfeitTimer(game.id, game.playerOneId, game.playerTwoId, tournamentId);
+        });
+      }
     }
   }
 
@@ -268,6 +403,36 @@ export class TournamentGateway {
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to delete tournament',
+      };
+    }
+  }
+
+  @SubscribeMessage('getPlayerActiveTournament')
+  async handleGetPlayerActiveTournament(
+    @MessageBody() data: { playerId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const tournament = await this.tournamentService.getPlayerActiveTournament(data.playerId);
+
+      if (!tournament) {
+        return {
+          success: false,
+          error: 'No active tournament found',
+        };
+      }
+
+      // Rejoin socket room for tournament updates
+      client.join(`tournament:${tournament.id}`);
+
+      return {
+        success: true,
+        tournament,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get active tournament',
       };
     }
   }

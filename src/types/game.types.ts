@@ -3,7 +3,10 @@ export type PlayerRole = 'one' | 'two';
 export type GameBoard = CellColor[][];
 
 export interface Player {
-  id: string;
+  id: string; // token
+  username: string;
+  avatar?: string;
+  avatarType?: string;
   role: PlayerRole;
   color: 'red' | 'yellow';
   socketId: string;
@@ -40,8 +43,20 @@ export interface GameState {
   winningLine: [number, number][] | null;
   isDraw: boolean;
   players: {
-    playerOne: { id: string; connected: boolean } | null;
-    playerTwo: { id: string; connected: boolean } | null;
+    playerOne: {
+      id: string;
+      connected: boolean;
+      username: string;
+      avatar?: string;
+      avatarType?: string;
+    } | null;
+    playerTwo: {
+      id: string;
+      connected: boolean;
+      username: string;
+      avatar?: string;
+      avatarType?: string;
+    } | null;
   };
 }
 
