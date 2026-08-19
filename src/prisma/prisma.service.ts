@@ -4,14 +4,11 @@ import { PrismaClient } from '@prisma/client';
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
   constructor() {
+    // The connection URL comes from `env("DATABASE_URL")` in schema.prisma.
+    // Overriding `datasources` here as well meant the same setting was declared in
+    // two places that could quietly disagree, and it bypassed the schema's
+    // datasource block entirely.
     super({
-      datasources: {
-        db: {
-          url: process.env.DATABASE_URL,
-        },
-      },
-      // Configure connection pool for Supabase pooler
-      // Supabase Session mode has limited connections (typically 3-15)
       log: ['error', 'warn'],
     });
   }

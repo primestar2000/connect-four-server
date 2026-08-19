@@ -4,19 +4,25 @@ services:
     env: node
     region: frankfurt
     plan: free
-    # `prisma migrate deploy` applies any migrations the database has not seen yet.
-    # Without it the schema was only ever created by pasting SQL into the Supabase
-    # editor by hand, so a database that missed that step served every request with
-    # "the table public.players does not exist".
+    # NOTE: this file only takes effect for Blueprint-managed services. If the
+    # build and start commands are set in the Render dashboard, those win and
+    # edits here do nothing.
+    #
+    # `prisma migrate deploy` applies any migrations the database has not seen
+    # yet. Without it the schema was only ever created by pasting SQL into the
+    # database console by hand, so a database that missed that step served every
+    # request with "the table public.players does not exist".
     buildCommand: npm install && rm -rf node_modules/.prisma && npx prisma generate && npx prisma migrate deploy && npm run build
     startCommand: npm run start:prod
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
-      # Set in the Render dashboard. DATABASE_URL is the pooled connection used at
-      # runtime; DIRECT_URL is used only by migrations, which need a connection
-      # without pgbouncer's statement pooling.
+      # Both are set in the Render dashboard.
+      #   DATABASE_URL - Neon pooled connection  (host contains "-pooler")
+      #   DIRECT_URL   - Neon direct connection  (same host without "-pooler"),
+      #                  used only by migrations, which need a connection that is
+      #                  not statement-pooled.
       - key: DATABASE_URL
         sync: false
       - key: DIRECT_URL
