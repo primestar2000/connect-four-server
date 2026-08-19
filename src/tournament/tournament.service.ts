@@ -12,6 +12,19 @@ interface CreateTournamentDto {
   moveTimeoutSeconds?: number;
 }
 
+interface RoundResult {
+  roundComplete: boolean;
+  tournamentComplete: boolean;
+  nextRound?: number;
+}
+
+export interface CompleteGameResult {
+  game: Awaited<ReturnType<PrismaService['game']['findUnique']>>;
+  roundResult: RoundResult;
+  /** True when another handler had already recorded this game's result. */
+  alreadyCompleted: boolean;
+}
+
 interface JoinTournamentDto {
   tournamentId: string;
   playerId: string;
@@ -249,94 +262,114 @@ export class TournamentService {
     return this.getTournament(tournamentId);
   }
 
+  /**
+   * Creates the games for a round.
+   *
+   * Returns the round's existing games untouched if it has already been generated,
+   * so that two games finishing at the same instant cannot produce a duplicated
+   * bracket.
+   */
   async generateRoundMatchups(tournamentId: string, round: number) {
-    const tournament = await this.prisma.tournament.findUnique({
-      where: { id: tournamentId },
-      include: {
-        players: {
-          where: {
-            isEliminated: false,
-          },
-          include: {
-            player: true,
-          },
-          orderBy: {
-            seed: 'asc',
-          },
-        },
-      },
+    const existing = await this.prisma.game.findMany({
+      where: { tournamentId, round },
+      include: { playerOne: true, playerTwo: true },
     });
 
-    if (!tournament) {
-      throw new Error('Tournament not found');
+    if (existing.length > 0) {
+      console.log(`Round ${round} of tournament ${tournamentId} already generated`);
+      return existing;
     }
 
-    const activePlayers = tournament.players;
+    const activePlayers = await this.prisma.tournamentPlayer.findMany({
+      where: { tournamentId, isEliminated: false },
+      include: { player: true },
+      orderBy: { seed: 'asc' },
+    });
 
-    // Handle byes if odd number of players
-    if (activePlayers.length % 2 !== 0) {
-      // Give bye to the first player (lowest seed)
+    if (activePlayers.length < 2) {
+      console.log(`Not enough players to generate round ${round}`);
+      return [];
+    }
+
+    const pairable = [...activePlayers];
+
+    if (pairable.length % 2 !== 0) {
+      // Give the bye to someone who has not had one yet, so the same player is not
+      // repeatedly walked through the bracket.
+      const byeIndex = Math.max(
+        0,
+        pairable.findIndex((p) => !p.hasBye),
+      );
+      const [byePlayer] = pairable.splice(byeIndex, 1);
+
       await this.prisma.tournamentPlayer.update({
-        where: { id: activePlayers[0].id },
+        where: { id: byePlayer.id },
         data: { hasBye: true },
       });
 
-      // Remove them from matchups
-      activePlayers.shift();
+      console.log(`${byePlayer.player.username} receives a bye in round ${round}`);
     }
 
-    // Create games for pairs
-    const games = [];
-    for (let i = 0; i < activePlayers.length; i += 2) {
-      const game = await this.prisma.game.create({
-        data: {
-          tournamentId,
-          playerOneId: activePlayers[i].playerId,
-          playerTwoId: activePlayers[i + 1].playerId,
-          round,
-          status: 'IN_PROGRESS',
-        },
-        include: {
-          playerOne: true,
-          playerTwo: true,
-        },
-      });
-      games.push(game);
+    const pairs: [string, string][] = [];
+    for (let i = 0; i < pairable.length; i += 2) {
+      pairs.push([pairable[i].playerId, pairable[i + 1].playerId]);
+    }
 
+    const games = await Promise.all(
+      pairs.map(([playerOneId, playerTwoId]) =>
+        this.prisma.game.create({
+          data: {
+            tournamentId,
+            playerOneId,
+            playerTwoId,
+            round,
+            status: 'IN_PROGRESS',
+          },
+          include: { playerOne: true, playerTwo: true },
+        }),
+      ),
+    );
+
+    games.forEach((game) => {
       console.log(
-        `Created tournament game ${game.id} for round ${round}: ${game.playerOne.username} vs ${game.playerTwo.username}`,
+        `Created round ${round} game ${game.id}: ${game.playerOne.username} vs ${game.playerTwo.username}`,
       );
-    }
+    });
 
     return games;
   }
 
-  async completeGame(gameId: string, winnerId: string | null, isDraw: boolean) {
-    const game = await this.prisma.game.findUnique({
-      where: { id: gameId },
-      include: {
-        tournament: {
-          include: {
-            players: true,
-            games: {
-              where: {
-                round: {
-                  not: null,
-                },
-              },
-            },
-          },
-        },
-      },
-    });
+  /**
+   * Records the result of a tournament game.
+   *
+   * Idempotent by design: several code paths can legitimately try to finish the
+   * same game at nearly the same moment (a winning move, a move timeout, a
+   * disconnect forfeit). Only the first one is allowed to eliminate a player or
+   * advance the bracket; the rest report `alreadyCompleted` and change nothing.
+   */
+  async completeGame(
+    gameId: string,
+    winnerId: string | null,
+    isDraw: boolean,
+  ): Promise<CompleteGameResult> {
+    const game = await this.prisma.game.findUnique({ where: { id: gameId } });
 
     if (!game) {
       throw new Error('Game not found');
     }
 
-    // Update game
-    await this.prisma.game.update({
-      where: { id: gameId },
+    if (game.status === 'COMPLETED') {
+      return {
+        game: await this.loadGame(gameId),
+        roundResult: { roundComplete: false, tournamentComplete: false },
+        alreadyCompleted: true,
+      };
+    }
+
+    // Claim the game with a conditional update. If another handler got here first
+    // this matches zero rows and we bail out instead of double-eliminating anyone.
+    const claim = await this.prisma.game.updateMany({
+      where: { id: gameId, status: 'IN_PROGRESS' },
       data: {
         winnerId,
         isDraw,
@@ -345,90 +378,63 @@ export class TournamentService {
       },
     });
 
-    // If tournament game, handle elimination
-    if (game.tournamentId && !isDraw && winnerId) {
-      const loserId = winnerId === game.playerOneId ? game.playerTwoId : game.playerOneId;
-
-      // Eliminate loser
-      await this.prisma.tournamentPlayer.updateMany({
-        where: {
-          tournamentId: game.tournamentId,
-          playerId: loserId,
-        },
-        data: {
-          isEliminated: true,
-        },
-      });
-
-      console.log(
-        `Tournament ${game.tournamentId}: Player ${loserId} eliminated, Player ${winnerId} advances`,
-      );
-
-      // Check if round is complete and return the result
-      const roundResult = await this.checkRoundComplete(game.tournamentId, game.round!);
-
+    if (claim.count === 0) {
       return {
-        game: await this.prisma.game.findUnique({
-          where: { id: gameId },
-          include: {
-            playerOne: true,
-            playerTwo: true,
-            tournament: true,
-          },
-        }),
-        roundResult,
+        game: await this.loadGame(gameId),
+        roundResult: { roundComplete: false, tournamentComplete: false },
+        alreadyCompleted: true,
       };
-    } else if (game.tournamentId && isDraw) {
-      // Handle draw - eliminate both players or schedule rematch
-      console.log(`Tournament game ${gameId} ended in draw - both players eliminated`);
-
-      await this.prisma.tournamentPlayer.updateMany({
-        where: {
-          tournamentId: game.tournamentId,
-          playerId: {
-            in: [game.playerOneId, game.playerTwoId],
-          },
-        },
-        data: {
-          isEliminated: true,
-        },
-      });
-
-      // Check if round is complete
-      if (game.round) {
-        const roundResult = await this.checkRoundComplete(game.tournamentId, game.round);
-
-        return {
-          game: await this.prisma.game.findUnique({
-            where: { id: gameId },
-            include: {
-              playerOne: true,
-              playerTwo: true,
-              tournament: true,
-            },
-          }),
-          roundResult,
-        };
-      }
     }
 
+    if (!game.tournamentId) {
+      return {
+        game: await this.loadGame(gameId),
+        roundResult: { roundComplete: false, tournamentComplete: false },
+        alreadyCompleted: false,
+      };
+    }
+
+    const eliminated: string[] = [];
+
+    if (isDraw) {
+      // Neither player advances from a drawn tournament game.
+      eliminated.push(game.playerOneId, game.playerTwoId);
+    } else if (winnerId) {
+      eliminated.push(winnerId === game.playerOneId ? game.playerTwoId : game.playerOneId);
+    }
+
+    if (eliminated.length > 0) {
+      await this.prisma.tournamentPlayer.updateMany({
+        where: { tournamentId: game.tournamentId, playerId: { in: eliminated } },
+        data: { isEliminated: true },
+      });
+
+      console.log(`Tournament ${game.tournamentId}: eliminated ${eliminated.join(', ')}`);
+    }
+
+    const roundResult = game.round
+      ? await this.checkRoundComplete(game.tournamentId, game.round)
+      : { roundComplete: false, tournamentComplete: false };
+
     return {
-      game: await this.prisma.game.findUnique({
-        where: { id: gameId },
-        include: {
-          playerOne: true,
-          playerTwo: true,
-          tournament: true,
-        },
-      }),
-      roundResult: { roundComplete: false, tournamentComplete: false },
+      game: await this.loadGame(gameId),
+      roundResult,
+      alreadyCompleted: false,
     };
   }
 
-  async checkRoundComplete(
-    tournamentId: string,
-    round: number,
-  ): Promise<{ roundComplete: boolean; tournamentComplete: boolean; nextRound?: number }> {
+  private loadGame(gameId: string) {
+    return this.prisma.game.findUnique({
+      where: { id: gameId },
+      include: {
+        playerOne: true,
+        playerTwo: true,
+        tournament: true,
+      },
+    });
+  }
+
+  async checkRoundComplete(tournamentId: string, round: number): Promise<RoundResult> {
     const tournament = await this.prisma.tournament.findUnique({
       where: { id: tournamentId },
       include: {
@@ -503,16 +509,8 @@ export class TournamentService {
       },
     });
 
-    // Reset bye flags
-    await this.prisma.tournamentPlayer.updateMany({
-      where: {
-        tournamentId,
-        hasBye: true,
-      },
-      data: {
-        hasBye: false,
-      },
-    });
+    // `hasBye` is deliberately not reset: it is the record of who has already been
+    // walked through a round, which is how the next bye gets handed to someone else.
 
     // Generate next round matchups
     const newGames = await this.generateRoundMatchups(tournamentId, nextRound);
@@ -564,6 +562,12 @@ export class TournamentService {
     });
   }
 
+  /** Accepts either an anonymous token or a database id and returns the database id. */
+  private async resolvePlayerId(tokenOrId: string): Promise<string> {
+    const byToken = await this.prisma.player.findUnique({ where: { token: tokenOrId } });
+    return byToken?.id ?? tokenOrId;
+  }
+
   private generateInviteCode(): string {
     // Generate a 6-character alphanumeric code
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude similar looking chars
@@ -604,11 +608,13 @@ export class TournamentService {
       throw new Error('Cannot leave tournament that has already started');
     }
 
-    // Remove player from tournament
+    // Callers identify players by token; the join table stores database ids.
+    const dbPlayerId = await this.resolvePlayerId(playerId);
+
     await this.prisma.tournamentPlayer.deleteMany({
       where: {
         tournamentId,
-        playerId,
+        playerId: dbPlayerId,
       },
     });
 

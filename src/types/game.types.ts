@@ -2,6 +2,19 @@ export type CellColor = 'red' | 'yellow' | null;
 export type PlayerRole = 'one' | 'two';
 export type GameBoard = CellColor[][];
 
+/** Board geometry. Single source of truth - do not duplicate these numbers. */
+export const BOARD = {
+  ROWS: 6,
+  COLS: 7,
+  CONNECT: 4,
+} as const;
+
+/** Player one is always red and always moves first. */
+export const ROLE_COLOR: Record<PlayerRole, 'red' | 'yellow'> = {
+  one: 'red',
+  two: 'yellow',
+};
+
 // Move timer configuration constants
 export const MOVE_TIMEOUT = {
   DEFAULT_CASUAL: 60, // 1 minute
@@ -21,7 +34,13 @@ export const MOVE_TIMEOUT = {
 };
 
 export interface Player {
-  id: string; // token
+  /** The player's anonymous token. Used for socket-level identity. */
+  id: string;
+  /**
+   * The player's database primary key. Populated as soon as we know it so that
+   * tournament code can match players without guessing which id flavour it holds.
+   */
+  dbId: string | null;
   username: string;
   avatar?: string;
   avatarType?: string;
@@ -53,6 +72,15 @@ export interface CreateRoomResponse {
   playerRole: PlayerRole;
 }
 
+export interface PublicPlayer {
+  id: string;
+  role: PlayerRole;
+  connected: boolean;
+  username: string;
+  avatar?: string;
+  avatarType?: string;
+}
+
 export interface JoinRoomResponse {
   roomId: string;
   playerId: string;
@@ -67,20 +95,8 @@ export interface GameState {
   winningLine: [number, number][] | null;
   isDraw: boolean;
   players: {
-    playerOne: {
-      id: string;
-      connected: boolean;
-      username: string;
-      avatar?: string;
-      avatarType?: string;
-    } | null;
-    playerTwo: {
-      id: string;
-      connected: boolean;
-      username: string;
-      avatar?: string;
-      avatarType?: string;
-    } | null;
+    playerOne: PublicPlayer | null;
+    playerTwo: PublicPlayer | null;
   };
 }
 

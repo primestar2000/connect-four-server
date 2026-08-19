@@ -109,19 +109,7 @@ export class TournamentGateway implements OnGatewayInit {
           tournament,
         });
 
-        // Set up forfeit timers for all games in the first round
-        if (tournament.games && tournament.games.length > 0) {
-          tournament.games.forEach((game) => {
-            if (game.round === 1 && game.status === 'IN_PROGRESS') {
-              this.setupGameForfeitTimer(
-                game.id,
-                game.playerOneId,
-                game.playerTwoId,
-                tournament.id,
-              );
-            }
-          });
-        }
+        this.scheduleRoundForfeitTimers(tournament.id, 1);
       }
 
       return {
@@ -136,6 +124,35 @@ export class TournamentGateway implements OnGatewayInit {
     }
   }
 
+  /** How long players have to turn up to a scheduled tournament game. */
+  private static readonly FORFEIT_TIMEOUT = 120000; // 2 minutes
+
+  /**
+   * Arms no-show timers for every open game in a round. Called when the tournament
+   * starts and again whenever a new round is generated - previously only round one
+   * was ever supervised.
+   */
+  scheduleRoundForfeitTimers(tournamentId: string, round: number): void {
+    void this.tournamentService
+      .getTournament(tournamentId)
+      .then((tournament) => {
+        if (!tournament) return;
+
+        const openGames = tournament.games.filter(
+          (game) => game.round === round && game.status === 'IN_PROGRESS',
+        );
+
+        console.log(`Arming forfeit timers for ${openGames.length} game(s) in round ${round}`);
+
+        openGames.forEach((game) => {
+          this.setupGameForfeitTimer(game.id, game.playerOneId, game.playerTwoId, tournamentId);
+        });
+      })
+      .catch((error) => {
+        console.error(`Failed to arm forfeit timers for round ${round}:`, error);
+      });
+  }
+
   // Set up forfeit timer for a tournament game
   private setupGameForfeitTimer(
     gameId: string,
@@ -143,87 +160,85 @@ export class TournamentGateway implements OnGatewayInit {
     playerTwoId: string,
     tournamentId: string,
   ) {
-    if (!this.gameService) {
-      console.error('GameService not available for forfeit timer');
+    this.gameService.setForfeitTimer(
+      gameId,
+      () => {
+        void this.resolveNoShow(gameId, playerOneId, playerTwoId, tournamentId);
+      },
+      TournamentGateway.FORFEIT_TIMEOUT,
+    );
+  }
+
+  private async resolveNoShow(
+    gameId: string,
+    playerOneId: string,
+    playerTwoId: string,
+    tournamentId: string,
+  ): Promise<void> {
+    console.log(`Forfeit timer expired for game ${gameId}`);
+
+    // Connection is checked against the players' database ids. The room re-keys a
+    // seat to the player's anonymous token once they connect, so comparing against
+    // `player.id` here reported everyone as absent.
+    const playerOnePresent = this.gameService.isConnectedByDbId(gameId, playerOneId);
+    const playerTwoPresent = this.gameService.isConnectedByDbId(gameId, playerTwoId);
+
+    if (playerOnePresent && playerTwoPresent) {
+      return; // both here, nothing to forfeit
+    }
+
+    const tournamentRoom = `tournament:${tournamentId}`;
+
+    // Nobody turned up: the game is a dead rubber, recorded as a draw so neither
+    // absentee advances.
+    if (!playerOnePresent && !playerTwoPresent) {
+      console.log(`Neither player joined game ${gameId} - recording a double forfeit`);
+      await this.tournamentService.completeGame(gameId, null, true);
+      this.server.to(tournamentRoom).emit('tournamentUpdated', {
+        tournament: await this.tournamentService.getTournament(tournamentId),
+      });
       return;
     }
 
-    const FORFEIT_TIMEOUT = 120000; // 2 minutes
+    const absentPlayerId = playerOnePresent ? playerTwoId : playerOneId;
+    const result = await this.tournamentService.forfeitTournamentGame(gameId, absentPlayerId);
 
-    this.gameService.setForfeitTimer(
-      gameId,
-      async () => {
-        console.log(`Forfeit timer expired for game ${gameId}`);
+    if (!result) return;
 
-        // Check if both players have joined
-        const room = this.gameService.getRoom(gameId);
+    this.server.to(gameId).emit('opponentForfeit', {
+      message: `${result.loserName} failed to join. ${result.winnerName} wins by forfeit!`,
+    });
 
-        if (!room) {
-          console.log(`Room ${gameId} not found, checking database...`);
+    this.server.to(tournamentRoom).emit('tournamentUpdated', {
+      tournament: await this.tournamentService.getTournament(tournamentId),
+    });
+  }
 
-          // Game room doesn't exist - neither player joined
-          // Forfeit both players
-          await this.tournamentService.forfeitTournamentGame(gameId, playerOneId);
-          await this.tournamentService.forfeitTournamentGame(gameId, playerTwoId);
+  /**
+   * Spectators subscribe to a tournament's broadcast room. Without these handlers
+   * the spectator view fetched the bracket once and then never updated, because
+   * the events it was listening for were only ever sent to this room.
+   */
+  @SubscribeMessage('joinTournamentRoom')
+  handleJoinTournamentRoom(
+    @MessageBody() data: { tournamentId: string },
+    @ConnectedSocket() client: Socket,
+  ): { success: boolean } {
+    if (!data?.tournamentId) return { success: false };
 
-          this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
-            tournamentId,
-            message: 'Game forfeited - neither player joined',
-          });
+    void client.join(`tournament:${data.tournamentId}`);
+    return { success: true };
+  }
 
-          return;
-        }
+  @SubscribeMessage('leaveTournamentRoom')
+  handleLeaveTournamentRoom(
+    @MessageBody() data: { tournamentId: string },
+    @ConnectedSocket() client: Socket,
+  ): { success: boolean } {
+    if (!data?.tournamentId) return { success: false };
 
-        // Check which players are connected
-        const player1Connected = room.players.some(
-          (p) => p.id === playerOneId && p.socketId !== '',
-        );
-        const player2Connected = room.players.some(
-          (p) => p.id === playerTwoId && p.socketId !== '',
-        );
-
-        if (!player1Connected && !player2Connected) {
-          // Neither player joined - both forfeit (draw/elimination)
-          console.log(`Neither player joined game ${gameId} - both forfeit`);
-          await this.tournamentService.forfeitTournamentGame(gameId, playerOneId);
-
-          this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
-            tournamentId,
-            message: 'Game forfeited - neither player joined',
-          });
-        } else if (!player1Connected) {
-          // Player 1 didn't join - player 2 wins
-          console.log(`Player 1 didn't join game ${gameId} - Player 2 wins by forfeit`);
-          const result = await this.tournamentService.forfeitTournamentGame(gameId, playerOneId);
-
-          if (result) {
-            this.server.to(gameId).emit('opponentForfeit', {
-              message: `${result.loserName} failed to join. ${result.winnerName} wins by forfeit!`,
-            });
-
-            this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
-              tournamentId,
-            });
-          }
-        } else if (!player2Connected) {
-          // Player 2 didn't join - player 1 wins
-          console.log(`Player 2 didn't join game ${gameId} - Player 1 wins by forfeit`);
-          const result = await this.tournamentService.forfeitTournamentGame(gameId, playerTwoId);
-
-          if (result) {
-            this.server.to(gameId).emit('opponentForfeit', {
-              message: `${result.loserName} failed to join. ${result.winnerName} wins by forfeit!`,
-            });
-
-            this.server.to(`tournament:${tournamentId}`).emit('tournamentUpdated', {
-              tournamentId,
-            });
-          }
-        }
-        // If both players joined, timer is cleared automatically
-      },
-      FORFEIT_TIMEOUT,
-    );
+    void client.leave(`tournament:${data.tournamentId}`);
+    return { success: true };
   }
 
   @SubscribeMessage('getTournament')
@@ -288,57 +303,6 @@ export class TournamentGateway implements OnGatewayInit {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to get tournament',
       };
-    }
-  }
-
-  // Notify tournament participants of game completion
-  async notifyGameComplete(tournamentId: string, gameId: string) {
-    const tournament = await this.tournamentService.getTournament(tournamentId);
-
-    if (tournament) {
-      this.server.to(`tournament:${tournamentId}`).emit('gameCompleted', {
-        tournament,
-        gameId,
-      });
-    }
-  }
-
-  // Notify tournament participants of round completion
-  async notifyRoundComplete(tournamentId: string, round: number) {
-    const tournament = await this.tournamentService.getTournament(tournamentId);
-
-    if (tournament) {
-      this.server.to(`tournament:${tournamentId}`).emit('roundCompleted', {
-        tournament,
-        round,
-      });
-
-      // Set up forfeit timers for new round games
-      if (tournament.games && tournament.games.length > 0) {
-        const nextRound = round + 1;
-        const newRoundGames = tournament.games.filter(
-          (game) => game.round === nextRound && game.status === 'IN_PROGRESS',
-        );
-
-        console.log(
-          `Setting up forfeit timers for ${newRoundGames.length} games in round ${nextRound}`,
-        );
-
-        newRoundGames.forEach((game) => {
-          this.setupGameForfeitTimer(game.id, game.playerOneId, game.playerTwoId, tournamentId);
-        });
-      }
-    }
-  }
-
-  // Notify tournament completion
-  async notifyTournamentComplete(tournamentId: string) {
-    const tournament = await this.tournamentService.getTournament(tournamentId);
-
-    if (tournament) {
-      this.server.to(`tournament:${tournamentId}`).emit('tournamentCompleted', {
-        tournament,
-      });
     }
   }
 

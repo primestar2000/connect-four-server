@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 
 interface WaitingPlayer {
   socketId: string;
@@ -8,55 +8,33 @@ interface WaitingPlayer {
 
 @Injectable()
 export class MatchmakingService {
+  private readonly logger = new Logger(MatchmakingService.name);
   private waitingPlayers: WaitingPlayer[] = [];
 
   addToQueue(socketId: string, playerId: string): void {
-    // Check if player is already in queue
-    const existingIndex = this.waitingPlayers.findIndex((p) => p.socketId === socketId);
+    if (this.waitingPlayers.some((p) => p.socketId === socketId)) return;
 
-    if (existingIndex !== -1) {
-      return; // Already in queue
-    }
-
-    this.waitingPlayers.push({
-      socketId,
-      playerId,
-      joinedAt: new Date(),
-    });
-
-    console.log(
-      `Player ${playerId} added to matchmaking queue. Queue size: ${this.waitingPlayers.length}`,
-    );
+    this.waitingPlayers.push({ socketId, playerId, joinedAt: new Date() });
+    this.logger.log(`Player queued. Queue size: ${this.waitingPlayers.length}`);
   }
 
   removeFromQueue(socketId: string): boolean {
     const index = this.waitingPlayers.findIndex((p) => p.socketId === socketId);
+    if (index === -1) return false;
 
-    if (index !== -1) {
-      const removed = this.waitingPlayers.splice(index, 1)[0];
-      console.log(
-        `Player ${removed.playerId} removed from queue. Queue size: ${this.waitingPlayers.length}`,
-      );
-      return true;
-    }
-
-    return false;
+    this.waitingPlayers.splice(index, 1);
+    this.logger.log(`Player left queue. Queue size: ${this.waitingPlayers.length}`);
+    return true;
   }
 
-  findMatch(): { player1: WaitingPlayer; player2: WaitingPlayer } | null {
-    if (this.waitingPlayers.length < 2) {
-      return null;
-    }
-
-    // Get the two players who have been waiting the longest
-    const player1 = this.waitingPlayers.shift()!;
-    const player2 = this.waitingPlayers.shift()!;
-
-    console.log(
-      `Match found: ${player1.playerId} vs ${player2.playerId}. Queue size: ${this.waitingPlayers.length}`,
-    );
-
-    return { player1, player2 };
+  /**
+   * Returns the two longest-waiting players *without* removing them. The caller
+   * removes them only once it has actually created a game, so a failure part-way
+   * through does not quietly swallow both players.
+   */
+  peekMatch(): { player1: WaitingPlayer; player2: WaitingPlayer } | null {
+    if (this.waitingPlayers.length < 2) return null;
+    return { player1: this.waitingPlayers[0], player2: this.waitingPlayers[1] };
   }
 
   getQueueSize(): number {
