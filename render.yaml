@@ -4,8 +4,20 @@ services:
     env: node
     region: frankfurt
     plan: free
-    buildCommand: npm install && rm -rf node_modules/.prisma && npx prisma generate && npm run build
+    # `prisma migrate deploy` applies any migrations the database has not seen yet.
+    # Without it the schema was only ever created by pasting SQL into the Supabase
+    # editor by hand, so a database that missed that step served every request with
+    # "the table public.players does not exist".
+    buildCommand: npm install && rm -rf node_modules/.prisma && npx prisma generate && npx prisma migrate deploy && npm run build
     startCommand: npm run start:prod
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      # Set in the Render dashboard. DATABASE_URL is the pooled connection used at
+      # runtime; DIRECT_URL is used only by migrations, which need a connection
+      # without pgbouncer's statement pooling.
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false

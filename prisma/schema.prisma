@@ -4,7 +4,11 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  // Pooled connection, used by the running application.
   url      = env("DATABASE_URL")
+  // Unpooled connection, used only by `prisma migrate`. Migrations take advisory
+  // locks and issue DDL, which does not survive pgbouncer's statement pooling.
+  directUrl = env("DIRECT_URL")
 }
 
 model Player {
